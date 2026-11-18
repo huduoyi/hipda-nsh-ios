@@ -1,0 +1,73 @@
+name: Build iOS IPA (unsigned, for sideload)
+
+# 手动触发，避免浪费 macOS runner 额度（免费账号每月 2000 分钟，macOS 按 10 倍计）
+on:
+  workflow_dispatch:
+
+env:
+  # 必须与 Cargo.toml / Cargo.lock 里的 nsh-* crate 版本一致（0.5.0）
+  NSH_VERSION: v0.5.0
+
+jobs:
+  build:
+    # iOS 运行时组件只有 Apple Silicon macOS 版本（nsh-ios-macos-arm64.tar.gz）
+    # 必须用 arm64 runner：macos-15 / macos-latest（M1）。macos-*-intel 是 Intel，装不了 iOS 组件。
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          rustc --version
+
+      - name: Add Rust iOS target
+        run: rustup target add aarch64-apple-ios
+
+      - name: Install nsh ${{ env.NSH_VERSION }}
+        run: |
+          curl -fsSL https://nsh.dev/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Verify nsh
+        run: "$HOME/.local/bin/nsh" --version
+
+      - name: Install iOS runtime component
+        run: "$HOME/.local/bin/nsh" component add ios
+
+      - name: Package unsigned iOS app
+        # 不传 --sign / --profile：产出未签名的 .app（免费 Apple ID 无法在 CI 签名，
+        # 签名放到本机用 Sideloadly 完成）。--build 用 CI 序号递增。
+        run: |
+          "$HOME/.local/bin/nsh" package --target ios \
+            --icon assets/icon.png \
+            --build "${{ github.run_number }}"
+          echo "--- .nsh/out ---"
+          ls -la .nsh/out
+
+      - name: Wrap .app into installable IPA
+        # Sideloadly 吃的是 .ipa 容器（本质是 zip：Payload/<Name>.app）。
+        # nsh.json 的 name 含中文与「·」，这里把目录重命名为 ASCII 的 HiPDA.app，
+        # 避免 zip/路径编码问题；App 的显示名仍由 Info.plist 决定，不受影响。
+        run: |
+          set -euo pipefail
+          APP=$(find .nsh/out -maxdepth 1 -type d -name '*.app' | head -n 1)
+          if [ -z "$APP" ]; then
+            echo "ERROR: no .app found in .nsh/out"
+            exit 1
+          fi
+          echo "Found app bundle: $APP"
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R "$APP" Payload/HiPDA.app
+          zip -qry HiPDA-nsh-unsigned.ipa Payload
+          ls -lh HiPDA-nsh-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: HiPDA-nsh-iOS-unsigned
+          path: HiPDA-nsh-unsigned.ipa
+          retention-days: 30
