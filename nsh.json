@@ -1,0 +1,28 @@
+{
+  "name": "HiPDA·nsh 版",
+  "id": "cn.hipda.nsh.unofficial",
+  "version": "0.1.0",
+  "build": 1,
+  "rust": ".",
+  "root": "App",
+  "theme": "theme.json",
+  "appearance": "system",
+  "capabilities": {
+    "network": {
+      "hosts": [
+        "www.4d4y.com",
+        "4d4y.com",
+        "img02.4d4y.com",
+        "*.4d4y.com"
+      ]
+    },
+    "statusBar": true,
+    "picker": true,
+    "openUrl": {
+      "schemes": [
+        "https",
+        "http"
+      ]
+    }
+  }
+}
