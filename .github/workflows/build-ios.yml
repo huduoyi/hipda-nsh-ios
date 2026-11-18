@@ -32,10 +32,12 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Verify nsh
-        run: "$HOME/.local/bin/nsh" --version
+        run: |
+          "$HOME/.local/bin/nsh" --version
 
       - name: Install iOS runtime component
-        run: "$HOME/.local/bin/nsh" component add ios
+        run: |
+          "$HOME/.local/bin/nsh" component add ios
 
       - name: Package unsigned iOS app
         # 不传 --sign / --profile：产出未签名的 .app（免费 Apple ID 无法在 CI 签名，
