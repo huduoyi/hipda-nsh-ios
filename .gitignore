@@ -1,0 +1,24 @@
+# NSH 生成的构建缓存与平台产物（由 nsh check/test/build 重建）
+.nsh/
+target/
+.nsh/out/
+# 打包产物（DMG / zip 体积大，发布时再上传，不进仓库）
+dist/
+
+# 本机 / 编辑器
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# 运行时敏感数据：会话快照含 cdb_auth 登录态 cookie，绝不能入库
+session.json
+*.session.json
+*.secret
+*.key
+.env
+.env.*
+
+# 本地日志与临时样本
+*.log
+tmp/
