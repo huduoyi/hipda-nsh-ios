@@ -7,6 +7,10 @@ on:
 env:
   # 必须与 Cargo.toml / Cargo.lock 里的 nsh-* crate 版本一致（0.5.0）
   NSH_VERSION: v0.5.0
+  # 修复 nsh 0.5.0 的 iOS 链接错误 ___chkstk_darwin：runtime 默认按 ios10.0
+  # 链接，而 C 依赖用新 SDK 编译导致符号不匹配。固定到 NSH 最低支持的 15.0。
+  # 见 longbridge/nsh PR #2368（2026-11-18 合并）。
+  IPHONEOS_DEPLOYMENT_TARGET: "15.0"
 
 jobs:
   build:
