@@ -1,0 +1,8 @@
+# Fix for nsh 0.5.0 iOS link error: "Undefined symbols: ___chkstk_darwin".
+# nsh 0.5.0 links the generated iOS runner with rustc's default deployment
+# target (iOS 10.0), while C dependencies (onig_sys, etc.) are compiled by
+# cc against the newer SDK -> link mismatch. Pinning the deployment target
+# to 15.0 (NSH's own minimum) makes both sides agree.
+# Reference: longbridge/nsh PR #2368 (merged 2026-11-18).
+[env]
+IPHONEOS_DEPLOYMENT_TARGET = "15.0"
