@@ -1,0 +1,2 @@
+// 程序图标资源：ID 1 是 NSH 的窗口类约定（见 build.rs 说明）
+1 ICON "icon.ico"
