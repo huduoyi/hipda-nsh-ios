@@ -48,7 +48,7 @@ jobs:
         # 签名放到本机用 Sideloadly 完成）。--build 用 CI 序号递增。
         run: |
           "$HOME/.local/bin/nsh" package --target ios \
-            --icon assets/icon.png \
+            --icon assets/icon-ios-1024.png \
             --build "${{ github.run_number }}"
           echo "--- .nsh/out ---"
           ls -la .nsh/out
