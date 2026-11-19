@@ -26,6 +26,8 @@ pub enum ListSource {
         author: String,
         fid: String,
         full_text: bool,
+        /// Discuz 的 `srchfrom` 秒数：0 不限，86400 一天内。
+        srchfrom: i64,
         page: i32,
     },
     /// 私信会话列表（`pm.php?filter=privatepm`）。
@@ -82,9 +84,9 @@ impl ListSource {
     pub fn with_page(&self, page: i32) -> Self {
         let page = page.max(1);
         match self {
-            Self::Search { query, author, fid, full_text, .. } => Self::Search {
+            Self::Search { query, author, fid, full_text, srchfrom, .. } => Self::Search {
                 query: query.clone(), author: author.clone(), fid: fid.clone(),
-                full_text: *full_text, page,
+                full_text: *full_text, srchfrom: *srchfrom, page,
             },
             Self::Favorites { .. } => Self::Favorites { page },
             Self::Attention { .. } => Self::Attention { page },
@@ -107,9 +109,9 @@ impl ListSource {
             Self::UserThreads { uid, page, .. } => Self::UserThreads {
                 uid: uid.clone(), search_id: search_id.to_string(), page: *page,
             },
-            Self::Search { query, author, fid, full_text, page } => Self::Search {
+            Self::Search { query, author, fid, full_text, srchfrom, page } => Self::Search {
                 query: query.clone(), author: author.clone(), fid: fid.clone(),
-                full_text: *full_text, page: *page,
+                full_text: *full_text, srchfrom: *srchfrom, page: *page,
             },
             other => other.clone(),
         }
@@ -122,9 +124,10 @@ impl ListSource {
             Self::Notifications => ep.thread_notify.clone(),
             Self::Sms => ep.sms.clone(),
             Self::SmsDetail { uid, .. } => format!("{}{uid}", ep.sms_detail),
-            Self::Search { query, author, fid, full_text, .. } => {
+            Self::Search { query, author, fid, full_text, srchfrom, .. } => {
                 let q = gbk(query);
                 let a = gbk(author);
+                let from = srchfrom.to_string();
                 fill(
                     &ep.search,
                     &[
@@ -132,6 +135,7 @@ impl ListSource {
                         ("srchtxt", q.as_str()),
                         ("srchuname", a.as_str()),
                         ("fid", fid.as_str()),
+                        ("srchfrom", from.as_str()),
                     ],
                 )
             }

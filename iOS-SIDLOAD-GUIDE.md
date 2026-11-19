@@ -57,16 +57,22 @@ git push -u origin main
 
 ### 3.2 签名安装
 
+> 先纠正一个常见误解：**Sideloadly 主界面上并没有「Apple ID 右侧的小锁/齿轮图标」这个入口**，
+> 应用专用密码也不是在 Sideloadly 里生成的，而是在苹果官网生成、在点 Start 后弹出的密码框里填。
+
 1. 打开 Sideloadly，把刚才的 `HiPDA-nsh-unsigned.ipa` 拖进窗口。
 2. **Apple ID** 栏填你的免费 Apple ID 邮箱。
-3. 点 **Apple ID** 右侧的小锁/齿轮图标 → 首次会要**应用专用密码**（app-specific password）：
-   - 去 appleid.apple.com 登录 → 「登录与安全性」→「应用专用密码」→ 生成一个，格式类似 `abcd-efgh-ijkl-mnop`。
-   - 把生成的密码填回 Sideloadly。Sideloadly 会把它交给 Apple 换取开发证书，**不会存你的 Apple ID 主密码**。
-   > 直接用主密码登录经常失败，用应用专用密码最稳。
+3. **先在浏览器生成应用专用密码**（app-specific password）：
+   - 打开 `appleid.apple.com` 登录 → 「登录与安全性」→「应用专用密码」→ 点生成，格式类似 `abcd-efgh-ijkl-mnop`。
+   - 这个密码只显示一次，先复制存好。这一步在**苹果官网**做，和 Sideloadly 界面无关。
 4. **Bundle Identifier** 保持默认（`cn.hipda.nsh.unofficial`）即可，不用改。
-5. 勾选 **" sign with a paid developer account" 保持不勾选**（我们是免费账号）。
-6. 点 **Start** → 选 **"Normal" 安装模式** → 等待签名+上传完成。
-7. 完成后 iPhone 桌面出现 **HiPDA·nsh 版**，打开即可用。
+5. **"sign with a paid developer account" 保持不勾选**（我们是免费账号）。
+6. 点 **Start**，这时才会弹出登录框：
+   - 弹出密码输入框 → 粘贴刚才生成的**应用专用密码**（不是 Apple ID 主密码）。
+   - 若接着弹双重认证 → 输入 iPhone/受信任设备上的 6 位验证码。
+   - 若它明确要主密码，也可以填主密码 + 验证码，但成功率不如应用专用密码稳。
+7. 选 **"Normal" 安装模式** → 等待签名+上传完成。
+8. 完成后 iPhone 桌面出现 **HiPDA·nsh 版**，打开即可用。
 
 ### 3.3 首次打开
 
@@ -105,6 +111,8 @@ app 内置了域名白名单，只允许访问：
 |---|---|
 | Actions 任务红色、日志见 `nsh component add ios` 失败 | runner 选错了。必须是 arm64 的 `macos-15` / `macos-latest`（Apple Silicon M1）；`macos-*-intel` 是 Intel，装不了 iOS 组件。 |
 | 日志见版本不匹配 / crate 编译报错 | `NSH_VERSION` 必须和 `Cargo.toml` 的 nsh-* 版本一致（当前 0.5.0）。 |
+| 打包时 `ld: Undefined symbols: ___chkstk_darwin` | nsh 0.5.0 的已知 bug：iOS runner 默认按 ios10.0 链接，C 依赖用新 SDK 编译导致不匹配。已在本仓库 workflow 和 `.cargo/config.toml` 里通过 `IPHONEOS_DEPLOYMENT_TARGET=15.0` 修复（见 longbridge/nsh PR #2368）。 |
+| **Start 按钮是灰的、点不动** | 不用去 Advanced Options 里勾任何东西（那里是改 Bundle ID/图标/注入插件/Anisette 等高级项）。按顺序查：① 顶部 **Apple ID 栏填邮箱了没**（最常见，留空就亮不了）；若这栏灰掉不能输入，是开了 "Hide Sensitive Information"，去设置里关掉。② iPhone 是否用数据线连上、点了「信任」，窗口顶部应显示设备名/iOS 版本；没识别就拔插数据线、完全退出重开 Sideloadly。③ IPA 是否真加载成功，窗口里应显示应用名「HiPDA·nsh 版」和图标；没有就重新拖一次或点 Select IPA 选文件。 |
 | Sideloadly 报 "An error occurred" / 证书相关错误 | 用应用专用密码代替主密码；确认 Apple ID 没开「隐藏邮件地址」；退出 iTunes 重开。 |
 | 装完打开闪退 | 没开开发者模式，或没信任描述文件（见 3.1 / 3.3）。 |
 | 签名时报 Bundle ID 冲突 | 免费账号同一个 ID 只能签有限个 App；把 Sideloadly 里的 Bundle Identifier 改成一个你自己的唯一串，例如 `cn.hipda.nsh.yourname`。 |

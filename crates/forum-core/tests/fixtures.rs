@@ -592,7 +592,7 @@ fn list_sources_build_urls_and_dom_kinds() {
     // 中文搜索词必须按 GBK 字节编码；翻页要接 &page。
     let url = ListSource::Search {
         query: "中文".into(), author: String::new(), fid: "0".into(),
-        full_text: false, page: 2,
+        full_text: false, srchfrom: 0, page: 2,
     }.url(&ep);
     assert!(url.contains("srchtxt=%D6%D0%CE%C4"), "{url}");
     assert!(url.ends_with("&page=2"), "{url}");

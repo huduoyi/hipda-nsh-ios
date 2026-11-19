@@ -34,9 +34,14 @@
       "sidebar-border": "oklch(0.84 0.008 85)",
       "sticky": "oklch(0.55 0.13 55)",
       "unread": "oklch(0.52 0.17 25)",
+      "skin-forest": "oklch(0.46 0.12 155)",
+      "skin-amber": "oklch(0.58 0.15 65)",
+      "skin-violet": "oklch(0.52 0.17 310)",
+      "skin-graphite": "oklch(0.38 0.012 260)",
       "quote": "oklch(0.945 0.008 250)",
       "quote-foreground": "oklch(0.42 0.012 260)",
-      "floor": "oklch(0.52 0.012 260)"
+      "floor": "oklch(0.52 0.012 260)",
+      "row-alt": "oklch(0.955 0.006 85)"
     },
     "dark": {
       "background": "oklch(0.19 0.008 260)",
@@ -64,9 +69,14 @@
       "sidebar-border": "oklch(0.40 0.010 260)",
       "sticky": "oklch(0.78 0.12 65)",
       "unread": "oklch(0.72 0.16 25)",
+      "skin-forest": "oklch(0.72 0.12 155)",
+      "skin-amber": "oklch(0.80 0.13 70)",
+      "skin-violet": "oklch(0.74 0.13 310)",
+      "skin-graphite": "oklch(0.78 0.012 260)",
       "quote": "oklch(0.27 0.012 255)",
       "quote-foreground": "oklch(0.80 0.010 255)",
-      "floor": "oklch(0.72 0.012 260)"
+      "floor": "oklch(0.72 0.012 260)",
+      "row-alt": "oklch(0.255 0.010 260)"
     }
   }
 }

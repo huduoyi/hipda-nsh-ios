@@ -11,7 +11,9 @@
 //! 4D4Y 是 Discuz! 7.2，没有官方 API；所有数据都来自 PHP 页面的 GBK HTML。
 //! 因此本客户端不缓存密码、不伪造登录态，也不在界面里塞演示数据。
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 use forum_core::config::{forum_name, local_forum_index, DEFAULT_FORUMS, FID_DISCOVERY};
@@ -28,7 +30,10 @@ use nsh_core::element::{AutoFill, input};
 use nsh_core::picker::FilePickRequest;
 use nsh_core::prelude::*;
 
-use settings::Settings;
+use settings::{
+    AvatarShape, AvatarSize, DefaultAvatar, Divider, ListStyle, ReadFade, SearchTime, Settings,
+    Skin, Spacing, TextScale, TitleSize, TitleWeight,
+};
 
 mod cache;
 mod session;
@@ -94,6 +99,17 @@ enum Screen {
     Settings,
 }
 
+/// 底部四个主标签。与 `Screen` 分开：详情页 / 设置页等属于某个标签的
+/// 下层界面，返回时底部仍高亮该标签。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Tab {
+    #[default]
+    Forum,
+    Message,
+    Search,
+    Mine,
+}
+
 /// 主题列表的一行。只保留界面要显示的字段，避免把内核模型绑到视图上。
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct ThreadRow {
@@ -102,6 +118,18 @@ struct ThreadRow {
     meta: String,
     badge: String,
     sticky: bool,
+    #[serde(default)]
+    author: String,
+    #[serde(default)]
+    avatar: String,
+    #[serde(default)]
+    time: String,
+    #[serde(default)]
+    replies: i64,
+    #[serde(default)]
+    is_new: bool,
+    #[serde(default)]
+    with_picture: bool,
 }
 
 impl ThreadRow {
@@ -120,6 +148,12 @@ impl ThreadRow {
             meta: format!("{} · {} 回复 · {} 浏览", t.author, t.reply_count, t.view_count),
             badge: badge.trim_end().to_string(),
             sticky: t.sticky,
+            author: t.author.clone(),
+            avatar: t.avatar_url.clone(),
+            time: if t.time_update.is_empty() { t.time_create.clone() } else { t.time_update.clone() },
+            replies: t.reply_count,
+            is_new: t.is_new,
+            with_picture: t.with_picture,
         }
     }
 }
@@ -205,6 +239,14 @@ impl PostRow {
                 .collect(),
         }
     }
+}
+
+/// 单个主题的浏览进度。持久化到 `Storage`，重开 App 也能回到上次位置。
+/// `offset` 是滚动偏移（pt），`last_floor` 是上次看到的楼层，用来判断新回复。
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+struct ThreadProgress {
+    offset: f32,
+    last_floor: i32,
 }
 
 /// 缓存里放的是**界面行**而不是内核模型：行结构稳定、字段少，
@@ -329,6 +371,25 @@ struct Ui {
     /// 详情页当前页码 / 总页数。Discuz 每页 50 层，长帖必须能往下翻。
     detail_page: Signal<i32>,
     detail_max: Signal<i32>,
+    /// 详情页滚动容器的元素句柄：程序化跳页 / 页首 / 页尾 / 恢复位置都靠它。
+    detail_scroll: Signal<ElementRef>,
+    /// 楼层号 → 该楼层标题行的元素句柄，用于「跳到指定楼层」精确 reveal。
+    /// 用普通 Rc<RefCell> 而非 Signal：楼层在渲染闭包里注册句柄，不进响应式，
+    /// 避免「渲染期写 signal」触发 effect 重入。
+    detail_floor_refs: Rc<RefCell<BTreeMap<i32, ElementRef>>>,
+    /// 当前滚动偏移（pt），on_scroll 持续写入，用于「返回原位置」。
+    detail_offset: Signal<f32>,
+    /// 跳转工具：目标楼层 / 目标页输入框内容。
+    detail_jump_floor: Signal<String>,
+    detail_jump_page: Signal<String>,
+    /// 跳走前保存的偏移；Some 时显示「返回原位置」。
+    detail_return_offset: Signal<Option<f32>>,
+    /// 每个主题上次的浏览进度（偏移 + 看到的最大楼层），按 tid 记录。
+    detail_progress: Signal<BTreeMap<String, ThreadProgress>>,
+    /// 待跳转的楼层：视图重建出该楼层后由 effect 执行 reveal 并清空。
+    detail_pending_floor: Signal<Option<i32>>,
+    /// 待恢复的浏览偏移：视图就绪后由 effect 执行 scroll_to 并清空。
+    detail_restore_offset: Signal<Option<f32>>,
     editor: Signal<String>,
     feed_rows: Signal<Vec<SimpleRow>>,
     feed_title: Signal<String>,
@@ -378,6 +439,19 @@ struct Ui {
     tail_open: Signal<bool>,
     tail_text: Signal<String>,
     tail_url: Signal<String>,
+    /// 0.2 界面重做：底部当前主标签。
+    tab: Signal<Tab>,
+    /// 顶栏头像菜单展开（登录 / 个人主页 / 账号管理）。
+    avatar_menu: Signal<bool>,
+    /// 顶栏版块切换菜单展开。
+    forum_menu: Signal<bool>,
+    /// 搜索页参数：标题 / 全文、版块、时间。改变后即时生效到下一次搜索。
+    search_full_text: Signal<bool>,
+    search_fid: Signal<String>,
+    search_time: Signal<SearchTime>,
+    /// 本次会话内已打开的帖子 tid，用于「已读淡化」。重启后清空可接受：
+    /// 淡化只是视觉提示，不影响数据。
+    read_tids: Signal<BTreeSet<String>>,
 }
 
 impl Ui {
@@ -407,6 +481,17 @@ impl Ui {
             image_ratio: signal(BTreeMap::new()),
             detail_page: signal(1),
             detail_max: signal(1),
+            // ElementRef 不实现 PartialEq，用 signal_with(Never)：句柄只用来发命令，
+            // 写入不该触发重建，正好符合需求。
+            detail_scroll: signal_with(element_ref(), SignalEquals::Never),
+            detail_floor_refs: Rc::new(RefCell::new(BTreeMap::new())),
+            detail_offset: signal(0.0),
+            detail_jump_floor: signal(String::new()),
+            detail_jump_page: signal(String::new()),
+            detail_return_offset: signal(None),
+            detail_progress: signal(BTreeMap::new()),
+            detail_pending_floor: signal(None),
+            detail_restore_offset: signal(None),
             editor: signal(String::new()),
             feed_rows: signal(Vec::new()),
             feed_title: signal("通知".into()),
@@ -442,6 +527,13 @@ impl Ui {
             tail_open: signal(false),
             tail_text: signal(String::new()),
             tail_url: signal(String::new()),
+            tab: signal(Tab::Forum),
+            avatar_menu: signal(false),
+            forum_menu: signal(false),
+            search_full_text: signal(false),
+            search_fid: signal("0".into()),
+            search_time: signal(SearchTime::All),
+            read_tids: signal(BTreeSet::new()),
         }
     }
 
@@ -1150,9 +1242,183 @@ impl Ui {
         });
     }
 
+    /// 把当前详情页的浏览进度写入内存与 Storage，供下次进入恢复。
+    /// 只在详情页、且有 tid 时写，避免污染其它界面。
+    fn save_detail_progress(&self) {
+        let tid = self.tid.get();
+        if tid.is_empty() || self.screen.get() != Screen::Detail {
+            return;
+        }
+        let last_floor = self.posts.with(|p| p.last().map(|r| r.floor).unwrap_or(0));
+        let progress = ThreadProgress {
+            offset: self.detail_offset.get().max(0.0),
+            last_floor,
+        };
+        self.detail_progress.update(|m| {
+            m.insert(tid.clone(), progress);
+        });
+        cache::put_progress(&tid, &progress);
+    }
+
+    /// 记录跳转前的位置，便于「跳到某楼层后一键回到原处」。
+    fn detail_mark_return(&self) {
+        self.detail_return_offset.set(Some(self.detail_offset.get()));
+    }
+
+    /// 回到上次跳转前的位置。
+    fn detail_return_pos(&self) {
+        if let Some(offset) = self.detail_return_offset.get() {
+            self.detail_scroll
+                .get()
+                .scroll_to(point(px(0.0), px(offset)), true);
+            self.detail_return_offset.set(None);
+        }
+    }
+
+    /// 跳到页首。
+    fn detail_scroll_top(&self) {
+        self.detail_mark_return();
+        self.detail_scroll
+            .get()
+            .scroll_to(point(px(0.0), px(0.0)), true);
+    }
+
+    /// 跳到页尾（当前已加载内容的最底部）。
+    fn detail_scroll_bottom(&self) {
+        self.detail_mark_return();
+        self.detail_scroll.get().scroll_to_end(true);
+    }
+
+    /// 跳到指定楼层：楼层已在列表里就直接 reveal；未加载则先把缺失的页
+    /// 连续加载进来，再由 effect 在楼层元素出现后 reveal。
+    fn detail_goto_floor(&self, floor: i32) {
+        if floor < 1 {
+            self.note("楼层号要大于 0");
+            return;
+        }
+        self.detail_mark_return();
+        let loaded = self.posts.with(|p| p.iter().any(|r| r.floor == floor));
+        if loaded {
+            self.detail_pending_floor.set(Some(floor));
+            return;
+        }
+        // 楼层不在已加载范围：连续加载到覆盖该楼层的页。Discuz 每页 50 层。
+        let max_floor = self.posts.with(|p| p.last().map(|r| r.floor).unwrap_or(0));
+        if floor <= max_floor {
+            self.note(format!("没有第 {floor} 楼（最高 {max_floor} 楼）"));
+            return;
+        }
+        self.detail_pending_floor.set(Some(floor));
+        self.clone().load_pages_for_floor(floor);
+    }
+
+    /// 连续加载后续页，直到列表里出现目标楼层或到达末页。
+    fn load_pages_for_floor(self, target_floor: i32) {
+        if self.busy.get() {
+            return;
+        }
+        let tid = self.tid.get();
+        if tid.is_empty() {
+            return;
+        }
+        self.busy.set(true);
+        self.note(format!("正在翻页以定位第 {target_floor} 楼…"));
+        spawn(async move {
+            loop {
+                let page = self.detail_page.get() + 1;
+                let max = self.detail_max.get();
+                if page > max {
+                    self.note(format!("已到末页，没有第 {target_floor} 楼"));
+                    break;
+                }
+                match self.client.thread_detail(&tid, page).await {
+                    Ok(detail) if detail.has_content() => {
+                        let (mut rows, _) = self.thread_rows(&detail.posts);
+                        let reached = rows.iter().any(|r| r.floor >= target_floor);
+                        self.posts.update(|list| list.append(&mut rows));
+                        self.detail_page.set(page);
+                        if reached {
+                            self.note(format!("已翻到第 {page} 页，定位第 {target_floor} 楼"));
+                            break;
+                        }
+                    }
+                    _ => {
+                        self.note(format!("第 {page} 页加载失败或为空，停止翻页"));
+                        break;
+                    }
+                }
+            }
+            self.busy.set(false);
+        });
+    }
+
+    /// 跳到指定页：连续加载到该页并定位到该页首层（Discuz 每页 50 层）。
+    fn detail_goto_page(&self, page: i32) {
+        if page < 1 {
+            self.note("页码要大于 0");
+            return;
+        }
+        let max = self.detail_max.get();
+        if page > max {
+            self.note(format!("本主题只有 {max} 页"));
+            return;
+        }
+        let first_floor = (page - 1) * 50 + 1;
+        self.note(format!("跳到第 {page} 页…"));
+        self.detail_goto_floor(first_floor);
+    }
+
+    /// 跳到新回复：进度里记录的最后楼层之后的第一层楼。
+    fn detail_goto_new_reply(&self) {
+        let tid = self.tid.get();
+        let last = self
+            .detail_progress
+            .get()
+            .get(&tid)
+            .map(|p| p.last_floor)
+            .unwrap_or(0);
+        if last <= 0 {
+            self.note("还没有上次浏览记录，从头开始看即可");
+            return;
+        }
+        let next = last + 1;
+        self.note(format!("跳到第 {next} 楼（上次看到 {last} 楼）"));
+        self.detail_goto_floor(next);
+    }
+
     fn open_thread(self, tid: String, title: String) {
         // 记录来源：可能从版块列表进入，也可能从通知 / 搜索结果进入。
         self.origin.set(self.screen.get());
+        // 已读淡化：本次会话打开过的帖子加入已读集合。
+        if !tid.is_empty() {
+            self.read_tids.update(|set| {
+                set.insert(tid.clone());
+            });
+        }
+
+        // 浏览位置：换主题要清掉上一主题的跳转状态，再读入本主题的进度。
+        // 进度来自内存表或 Storage（跨会话），由 detail_view 的 effect 在楼层
+        // 渲染出来后执行 scroll_to，避免内容还没布局就跳导致位置不准。
+        self.detail_offset.set(0.0);
+        self.detail_return_offset.set(None);
+        self.detail_pending_floor.set(None);
+        self.detail_floor_refs.borrow_mut().clear();
+        let progress = self
+            .detail_progress
+            .get()
+            .get(&tid)
+            .copied()
+            .or_else(|| cache::get_progress::<ThreadProgress>(&tid));
+        if let Some(p) = progress {
+            self.detail_progress.update(|m| {
+                m.insert(tid.clone(), p);
+            });
+            if p.offset > 1.0 {
+                self.detail_restore_offset.set(Some(p.offset));
+            }
+        } else {
+            self.detail_restore_offset.set(None);
+        }
 
         // 先放缓存：点开帖子立刻有内容，网络请求在后台跑。
         // 楼层结构（引用/图片/代码块）都缓存在 `posts` 里，恢复后排版一致。
@@ -1459,12 +1725,14 @@ fn post_login_target() -> (Screen, i32, i32) {
 }
 
 /// 搜索入口统一构造：`fid=0` 表示不限版块，中文关键词由内核按 GBK 编码。
-fn search_source(query: &str) -> ListSource {
+/// 标题 / 全文、版块与时间范围由界面参数传入（设置页会预填默认值）。
+fn search_source(query: &str, full_text: bool, fid: String, time: SearchTime) -> ListSource {
     ListSource::Search {
         query: query.trim().to_string(),
         author: String::new(),
-        fid: "0".into(),
-        full_text: false,
+        fid,
+        full_text,
+        srchfrom: time.seconds(),
         page: 1,
     }
 }
@@ -1506,6 +1774,8 @@ const ICON_LOGOUT: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0
 const ICON_GEAR: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.6 8a1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V2a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V8a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>"##;
 const ICON_MORE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#000" stroke="none"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>"##;
 const ICON_CHECK: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7"/></svg>"##;
+const ICON_EDIT: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4z"/></svg>"##;
+const ICON_CHEVRON_DOWN: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>"##;
 
 /// 图标：尺寸即视觉尺寸（图标应略小于同行文字，视觉上才不抢眼）。
 fn icon_secondary(markup: &'static str, size: f32) -> impl IntoElement {
@@ -1937,8 +2207,6 @@ fn threads_view(ui: Ui) -> impl IntoElement {
     let for_status = ui.clone();
     let for_notifications = ui.clone();
     let for_search = ui.clone();
-    let for_home = ui.clone();
-    let for_login = ui.clone();
     let for_menu = ui.clone();
     let for_overlay = ui.clone();
 
@@ -1947,41 +2215,21 @@ fn threads_view(ui: Ui) -> impl IntoElement {
         .gap_3()
         .px_4()
         .py_3()
+        // 版块菜单：发表新帖 / 排序 / 置顶 / 站内地址（对齐原版三点菜单）。
+        // 首页 / 登录入口已上移到三段顶栏，这里只保留三点菜单。
         .child(
             view()
                 .flex_row()
                 .items_center()
-                .justify_between()
-                .child(ghost_button_icon(ICON_HOME, "首页".into(), move || {
-                    for_home.screen.set(Screen::Index)
-                }))
-                .child(
-                    view()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .child(dynamic(move || {
-                            if for_login.logged_in.get() {
-                                Vec::new()
-                            } else {
-                                vec![
-                                    ghost_button("登录".into(), move || {
-                                        for_login.screen.set(Screen::Login)
-                                    })
-                                    .into_element(),
-                                ]
-                            }
-                        }))
-                        // 版块菜单：发表新帖 / 排序 / 置顶 / 站内地址（对齐原版三点菜单）。
-                        .child({
-                            let ui = for_menu.clone();
-                            ghost_button_icon(ICON_MORE, "菜单".into(), move || {
-                                let ui = ui.clone();
-                                let next = !ui.menu_open.get();
-                                ui.menu_open.set(next);
-                            })
-                        }),
-                ),
+                .justify_end()
+                .child({
+                    let ui = for_menu.clone();
+                    ghost_button_icon(ICON_MORE, "菜单".into(), move || {
+                        let ui = ui.clone();
+                        let next = !ui.menu_open.get();
+                        ui.menu_open.set(next);
+                    })
+                }),
         )
         // 版块切换：三个默认版块，触控目标 ≥44pt。
         .child(
@@ -2075,20 +2323,33 @@ fn threads_view(ui: Ui) -> impl IntoElement {
                     let ui_meta = ui.clone();
                     let ui_badge = ui.clone();
                     let ui_bg = ui.clone();
+                    let ui_avatar = ui.clone();
+                    let ui_tint = ui.clone();
+                    let ui_dot = ui.clone();
+                    let settings = ui.settings.get();
+                    let row_height = settings.spacing.row_height();
+                    let title_size = settings.title_size.pt();
+                    let title_weight = title_font_weight(settings.title_weight);
+                    let alternating = settings.alternating_rows;
+                    let read_fade = settings.read_fade;
+                    let accent_key = settings.skin.color_key();
+                    let index = at.index();
                     view()
                         .flex_row()
                         .items_center()
                         .gap_3()
                         .px_4()
-                        .py_3()
-                        .min_h(px(56.0))
-                        .rounded(px(12.0))
+                        .py_2()
+                        .min_h(px(row_height))
+                        .rounded(px(10.0))
                         .bg(move || {
                             let sticky = ui_bg
                                 .rows
-                                .with(|r| r.get(at.index()).is_some_and(|x| x.sticky));
+                                .with(|r| r.get(index).is_some_and(|x| x.sticky));
                             if sticky {
                                 theme().color("quote").unwrap_or(theme().card)
+                            } else if alternating && index % 2 == 1 {
+                                theme().color("row-alt").unwrap_or(theme().card)
                             } else {
                                 theme().card
                             }
@@ -2097,12 +2358,25 @@ fn threads_view(ui: Ui) -> impl IntoElement {
                         .on_press({
                             let ui = ui.clone();
                             move || {
-                                let row = ui.rows.with(|r| r.get(at.index()).cloned());
+                                let row = ui.rows.with(|r| r.get(index).cloned());
                                 if let Some(row) = row {
                                     ui.clone().open_thread(row.tid, row.title);
                                 }
                             }
                         })
+                        // 头像
+                        .child(dynamic(move || {
+                            let row = ui_avatar.rows.with(|r| r.get(index).cloned());
+                            match row {
+                                Some(row) => vec![list_avatar(
+                                    ui_avatar.clone(),
+                                    row.avatar,
+                                    row.author,
+                                )
+                                .into_element()],
+                                None => Vec::new(),
+                            }
+                        }))
                         .child(
                             view()
                                 .flex_1()
@@ -2110,17 +2384,37 @@ fn threads_view(ui: Ui) -> impl IntoElement {
                                 .child(
                                     text(move || {
                                         ui_title.rows.with(|r| {
-                                            r.get(at.index())
+                                            r.get(index)
                                                 .map(|x| x.title.clone())
                                                 .unwrap_or_default()
                                         })
                                     })
-                                    .font_weight(FontWeight::MEDIUM),
+                                    .text_size(px(title_size))
+                                    .font_weight(title_weight)
+                                    .text_color(move || {
+                                        let read = ui_tint.read_tids.with(|set| {
+                                            ui_tint.rows.with(|r| {
+                                                r.get(index)
+                                                    .map(|x| set.contains(&x.tid))
+                                                    .unwrap_or(false)
+                                            })
+                                        });
+                                        if !read {
+                                            theme().foreground
+                                        } else {
+                                            match read_fade {
+                                                ReadFade::None => theme().foreground,
+                                                ReadFade::Light => theme().muted_foreground,
+                                                ReadFade::Heavy => theme().color("floor")
+                                                    .unwrap_or(theme().muted_foreground),
+                                            }
+                                        }
+                                    }),
                                 )
                                 .child(
                                     text(move || {
                                         ui_meta.rows.with(|r| {
-                                            r.get(at.index())
+                                            r.get(index)
                                                 .map(|x| x.meta.clone())
                                                 .unwrap_or_default()
                                         })
@@ -2129,10 +2423,44 @@ fn threads_view(ui: Ui) -> impl IntoElement {
                                     .text_color(move || theme().muted_foreground),
                                 ),
                         )
+                        // 未读圆点 + 新回复胶囊 + 图片标记
+                        .child(dynamic(move || {
+                            let row = ui_dot.rows.with(|r| r.get(index).cloned());
+                            let Some(row) = row else { return Vec::new() };
+                            let mut out: Vec<AnyElement> = Vec::new();
+                            if settings.unread_dot && row.is_new {
+                                out.push(
+                                    view()
+                                        .w(px(8.0))
+                                        .h(px(8.0))
+                                        .rounded(px(4.0))
+                                        .bg(move || theme().color(accent_key)
+                                            .unwrap_or_else(|| theme().primary))
+                                        .into_element(),
+                                );
+                            }
+                            if settings.new_reply_mark && row.replies > 0 {
+                                out.push(
+                                    text(format!("{}", row.replies))
+                                        .text_size(px(12.0))
+                                        .text_color(move || theme().muted_foreground)
+                                        .into_element(),
+                                );
+                            }
+                            if row.with_picture {
+                                out.push(
+                                    text("图")
+                                        .text_size(px(10.0))
+                                        .text_color(move || theme().muted_foreground)
+                                        .into_element(),
+                                );
+                            }
+                            out
+                        }))
                         .child(
                             text(move || {
                                 ui_badge.rows.with(|r| {
-                                    r.get(at.index())
+                                    r.get(index)
                                         .map(|x| x.badge.clone())
                                         .unwrap_or_default()
                                 })
@@ -2300,6 +2628,98 @@ fn tidy_body(raw: &str) -> String {
         out.push('\n');
     }
     out.trim_end().to_string()
+}
+
+/// 列表头像（0.2 重做）：按排版样式 / 头像大小 / 形状 / 默认头像三件套渲染。
+/// 无头像样式返回空节点；地址为空时按「首字 / 像素块 / 首字浅色」兜底。
+fn list_avatar(ui: Ui, src: String, name: String) -> AnyElement {
+    let settings = ui.settings.get();
+    if settings.list_style == ListStyle::NoAvatar {
+        return view().into_element();
+    }
+    let size = match settings.list_style {
+        ListStyle::SmallAvatar => 34.0,
+        _ => settings.avatar_size.pt(),
+    };
+    let radius = match settings.avatar_shape {
+        AvatarShape::Round => size / 2.0,
+        AvatarShape::Square => 9.0,
+    };
+    let base = view()
+        .w(px(size))
+        .h(px(size))
+        .rounded(px(radius))
+        .overflow_hidden()
+        .bg(move || theme().muted);
+    if !src.trim().is_empty() {
+        return base
+            .child(image(src).w_full().h_full().object_fit(nsh_core::ResizeMode::Cover))
+            .into_element();
+    }
+    match settings.default_avatar {
+        DefaultAvatar::Pixel => {
+            // 名字哈希成 3×3 像素块，同一个人每次都是同一张「脸」。
+            let mut seed: u32 = 2166136261;
+            for b in name.bytes() {
+                seed ^= b as u32;
+                seed = seed.wrapping_mul(16777619);
+            }
+            let mut rows: Vec<AnyElement> = Vec::new();
+            for r in 0..3usize {
+                let mut cells: Vec<AnyElement> = Vec::new();
+                for c in 0..3usize {
+                    let on = ((seed >> (r * 3 + c)) & 1) == 1;
+                    let key = settings.skin.color_key();
+                    cells.push(
+                        view()
+                            .flex_1()
+                            .bg(move || {
+                                if on {
+                                    theme().color(key).unwrap_or_else(|| theme().primary)
+                                } else {
+                                    theme().card
+                                }
+                            })
+                            .into_element(),
+                    );
+                }
+                rows.push(view().flex_row().flex_1().children(cells).into_element());
+            }
+            base.child(view().w_full().h_full().children(rows))
+                .into_element()
+        }
+        style => {
+            let light = style == DefaultAvatar::InitialLight;
+            let first: String = name.chars().take(1).collect();
+            let first = if first.is_empty() { "?".to_string() } else { first };
+            let key = settings.skin.color_key();
+            base.items_center()
+                .justify_center()
+                .bg(move || {
+                    if light {
+                        theme().color(key).unwrap_or_else(|| theme().primary)
+                    } else {
+                        theme().muted
+                    }
+                })
+                .child(
+                    text(move || first.clone())
+                        .text_size(px(size * 0.42))
+                        .text_color(move || theme().muted_foreground),
+                )
+                .into_element()
+        }
+    }
+}
+
+/// 标题字重档位 → NSH 字重常量。
+fn title_font_weight(w: TitleWeight) -> FontWeight {
+    match w {
+        TitleWeight::Regular => FontWeight::NORMAL,
+        TitleWeight::Medium => FontWeight::MEDIUM,
+        TitleWeight::Semibold => FontWeight::SEMIBOLD,
+        TitleWeight::Bold => FontWeight::BOLD,
+    }
 }
 
 /// 楼层头头像：36pt。圆形是原版默认，设置里可以改成圆角方形；
@@ -2588,6 +3008,157 @@ fn render_block(
     }
 }
 
+/// 详情页的翻页 / 定位工具条。放在楼层滚动区上方，常驻可见。
+fn detail_nav_bar(ui: Ui) -> impl IntoElement {
+    let prev = ui.clone();
+    let next = ui.clone();
+    let top = ui.clone();
+    let bottom = ui.clone();
+    let back = ui.clone();
+    let new_reply = ui.clone();
+    let jump_page = ui.clone();
+    let jump_floor = ui.clone();
+    let page_go = ui.clone();
+    let floor_go = ui.clone();
+    let for_page_val = ui.clone();
+    let for_floor_val = ui.clone();
+    let page_change = ui.clone();
+    let floor_change = ui.clone();
+    let page_pages = ui.clone();
+
+    view()
+        .flex_col()
+        .gap(px(8.0))
+        .px_3()
+        .py_2()
+        .rounded(px(12.0))
+        .bg(move || theme().card)
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                // 上一页
+                .child(ghost_button("◀ 上一页".into(), move || {
+                    let p = prev.detail_page.get() - 1;
+                    if p >= 1 {
+                        prev.detail_goto_page(p);
+                    } else {
+                        prev.note("已经是第 1 页");
+                    }
+                }))
+                .child(
+                    text(move || {
+                        format!(
+                            "第 {}/{} 页",
+                            page_pages.detail_page.get(),
+                            page_pages.detail_max.get()
+                        )
+                    })
+                    .text_size(px(12.0))
+                    .text_color(move || theme().muted_foreground),
+                )
+                // 下一页
+                .child(ghost_button("下一页 ▶".into(), move || {
+                    let p = next.detail_page.get() + 1;
+                    if p <= next.detail_max.get() {
+                        next.detail_goto_page(p);
+                    } else {
+                        next.note("已经是最后一页");
+                    }
+                }))
+                // 页码输入 + 跳转
+                .child(
+                    field(
+                        "页",
+                        move || for_page_val.detail_jump_page.get(),
+                        move |v| page_change.detail_jump_page.set(v),
+                        move |v| {
+                            if let Ok(p) = v.trim().parse::<i32>() {
+                                jump_page.detail_goto_page(p);
+                            }
+                        },
+                        AutoFill::Off,
+                        false,
+                    )
+                    .w(px(52.0))
+                    .min_h(px(34.0)),
+                )
+                .child(ghost_button("跳页".into(), move || {
+                    let v = page_go.detail_jump_page.get();
+                    if let Ok(p) = v.trim().parse::<i32>() {
+                        page_go.detail_goto_page(p);
+                    } else {
+                        page_go.note("请输入页码数字");
+                    }
+                })),
+        )
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(ghost_button("页首".into(), move || top.detail_scroll_top()))
+                .child(ghost_button("页尾".into(), move || bottom.detail_scroll_bottom()))
+                // 楼层输入 + 跳转
+                .child(
+                    field(
+                        "楼层",
+                        move || for_floor_val.detail_jump_floor.get(),
+                        move |v| floor_change.detail_jump_floor.set(v),
+                        move |v| {
+                            if let Ok(f) = v.trim().parse::<i32>() {
+                                jump_floor.detail_goto_floor(f);
+                            }
+                        },
+                        AutoFill::Off,
+                        false,
+                    )
+                    .w(px(60.0))
+                    .min_h(px(34.0)),
+                )
+                .child(ghost_button("跳楼".into(), move || {
+                    let v = floor_go.detail_jump_floor.get();
+                    if let Ok(f) = v.trim().parse::<i32>() {
+                        floor_go.detail_goto_floor(f);
+                    } else {
+                        floor_go.note("请输入楼层数字");
+                    }
+                }))
+                // 返回原位置：仅跳转过后出现
+                .child(dynamic(move || {
+                    if back.detail_return_offset.get().is_some() {
+                        vec![ghost_button("↩ 原位置".into(), {
+                            let ui = back.clone();
+                            move || ui.detail_return_pos()
+                        })
+                        .into_element()]
+                    } else {
+                        Vec::new()
+                    }
+                }))
+                // 新回复：仅当本次主题有上次进度时出现
+                .child(dynamic(move || {
+                    let tid = new_reply.tid.get();
+                    let has = new_reply
+                        .detail_progress
+                        .get()
+                        .get(&tid)
+                        .map(|p| p.last_floor > 0)
+                        .unwrap_or(false);
+                    if has {
+                        vec![ghost_button("新回复 →".into(), {
+                            let ui = new_reply.clone();
+                            move || ui.detail_goto_new_reply()
+                        })
+                        .into_element()]
+                    } else {
+                        Vec::new()
+                    }
+                })),
+        )
+}
+
 fn detail_view(ui: Ui) -> impl IntoElement {
     let for_back = ui.clone();
     let for_home = ui.clone();
@@ -2596,6 +3167,36 @@ fn detail_view(ui: Ui) -> impl IntoElement {
     let for_poll = ui.clone();
     let for_hint = ui.clone();
     let for_pager = ui.clone();
+    let for_scroll = ui.clone();
+    let for_effect = ui.clone();
+    let for_tools = ui.clone();
+
+    // 楼层渲染 / 进度恢复的时序协调：
+    // - pending_floor：楼层元素出现后 reveal 过去（可能刚连续翻页加载进来）；
+    // - restore_offset：进入帖子、楼层渲染出来后滚回上次位置。
+    // 两个动作只执行一次，做完就清空，避免滚动时反复触发。
+    effect(move || {
+        let floor = for_effect.detail_pending_floor.get();
+        let posts = for_effect.posts.get();
+        if let Some(f) = floor {
+            if posts.iter().any(|p| p.floor == f) {
+                let found = for_effect.detail_floor_refs.borrow().get(&f).copied();
+                if let Some(r) = found {
+                    r.reveal(RevealOptions::default().vertical(ScrollAlignment::Start));
+                    for_effect.detail_pending_floor.set(None);
+                }
+            }
+        }
+        if let Some(offset) = for_effect.detail_restore_offset.get()
+            && !posts.is_empty()
+        {
+            for_effect
+                .detail_scroll
+                .get()
+                .scroll_to(point(px(0.0), px(offset)), false);
+            for_effect.detail_restore_offset.set(None);
+        }
+    });
 
     view()
         .flex_1()
@@ -2616,8 +3217,23 @@ fn detail_view(ui: Ui) -> impl IntoElement {
                 }))
                 .child(text(move || ui.title.get()).text_size(px(17.0)).font_weight(FontWeight::SEMIBOLD).flex_1()),
         )
+        // 跳转工具条：连续翻页 / 跳页 / 跳楼层 / 页首 / 页尾 / 返回原处 / 新回复。
+        .child(detail_nav_bar(for_tools.clone()))
         .child(
-            scroll().flex_1().child(
+            scroll()
+                .flex_1()
+                .element_ref(&ui.detail_scroll.get())
+                .on_scroll(move |event: &ScrollEvent| {
+                    let y = event.offset.y.0.max(0.0);
+                    for_scroll.detail_offset.set(y);
+                })
+                .on_scroll_end({
+                    let ui = ui.clone();
+                    move |_| {
+                        ui.save_detail_progress();
+                    }
+                })
+                .child(
                 // 注意：这里不能给 `flex_1()`。滚动容器的内容高度必须由子节点撑开；
                 // 一旦让内容视图也 flex_1，它就等于视口高度，超出一屏的部分
                 // （长正文、正文图片、楼层尾部）会被直接裁掉，且滚不到。
@@ -2660,9 +3276,16 @@ fn detail_view(ui: Ui) -> impl IntoElement {
                                 let for_body_size = for_posts.clone();
                                 let avatar_for_row = avatar.clone();
                                 let name_for_row = name_for_avatar.clone();
+                                // 每层楼一个句柄，注册到 map 供「跳到指定楼层」reveal 用。
+                                let floor_ref = element_ref();
+                                for_posts
+                                    .detail_floor_refs
+                                    .borrow_mut()
+                                    .insert(floor, floor_ref);
                                 view()
                                     .rounded(px(14.0))
                                     .bg(move || theme().card)
+                                    .element_ref(&floor_ref)
                                     // 楼层头吸顶：滚过一层楼时，作者与楼层信息一直可见，
                                     // 不用往上翻才知道自己在看谁的哪一楼。背景必须不透明，
                                     // 否则正文会从底部透出来。
@@ -3133,34 +3756,44 @@ fn feed_view(ui: Ui) -> impl IntoElement {
 
 fn search_view(ui: Ui) -> impl IntoElement {
     let for_input = ui.clone();
-    let for_go = ui.clone();
-    let for_cancel = ui.clone();
-    let for_home = ui.clone();
     let for_submit = ui.clone();
+    let for_go = ui.clone();
+    let for_scope = ui.clone();
+    let for_fid = ui.clone();
+    let for_time = ui.clone();
+
+    // 搜索参数初值：进页面时从设置同步一次，之后用户可在页内改。
+    // （Tab 切换时也会同步，这里再兜一次，防止直达搜索页参数为空。）
+    if ui.search_fid.get().is_empty() {
+        ui.search_fid.set(ui.settings.get().search_fid.clone());
+    }
 
     view()
         .flex_1()
         .gap_3()
         .px_4()
         .py_3()
-        .child(text("搜索论坛主题").text_size(px(20.0)).font_weight(FontWeight::BOLD))
         .child(
-            text("关键词按 GBK 编码提交，与论坛页面保持一致；回车或点「搜索」开始。")
-                .text_size(px(13.0))
-                .text_color(move || theme().muted_foreground),
+            text("搜索论坛")
+                .text_size(px(20.0))
+                .font_weight(FontWeight::BOLD),
         )
         .child(
             input()
-                .placeholder("输入关键词")
+                .placeholder("搜索帖子标题")
                 .value(move || for_input.query.get())
                 .on_change({
                     let ui = ui.clone();
                     move |v: &str| ui.query.set(v.to_string())
                 })
-                .on_submit(move |v: &str| {
-                    for_submit
-                        .clone()
-                        .load_list(search_source(v))
+                .on_submit({
+                    let ui = for_submit.clone();
+                    move |v: &str| {
+                        let full = ui.search_full_text.get();
+                        let fid = ui.search_fid.get();
+                        let time = ui.search_time.get();
+                        ui.clone().load_list(search_source(v, full, fid, time));
+                    }
                 })
                 .auto_correct(false)
                 .auto_capitalize(AutoCapitalize::None)
@@ -3171,22 +3804,157 @@ fn search_view(ui: Ui) -> impl IntoElement {
                 .bg(move || theme().card)
                 .text_color(move || theme().card_foreground),
         )
-        .child(primary_button("搜索".into(), move || {
-            let ui = for_go.clone();
-            ui.clone().load_list(search_source(&ui.query.get()));
-        }))
+        // 标题 / 全文
         .child(
             view()
                 .flex_row()
+                .items_center()
                 .gap_2()
-                .child(view().flex_1().child(ghost_button("取消".into(), move || {
-                    let origin = for_cancel.search_origin.get();
-                    for_cancel.screen.set(origin)
-                })))
-                .child(view().flex_1().child(ghost_button_icon(ICON_HOME, "首页".into(), move || {
-                    for_home.screen.set(Screen::Index)
-                }))),
+                .child(dynamic(move || {
+                    let ui = for_scope.clone();
+                    let full = ui.search_full_text.get();
+                    vec![
+                        filter_chip("标题", !full, {
+                            let ui = ui.clone();
+                            move || ui.search_full_text.set(false)
+                        }),
+                        filter_chip("全文", full, {
+                            let ui = ui.clone();
+                            move || ui.search_full_text.set(true)
+                        }),
+                    ]
+                })),
         )
+        // 版块选择：全部 + 默认版面，横向可换行
+        .child(dynamic(move || {
+            let ui = for_fid.clone();
+            let current = ui.search_fid.get();
+            let accent_key = ui.settings.get().skin.color_key();
+            let mut row = view().flex_row().flex_wrap().gap_2();
+            let (label, fid, on) = ("全部版块", "0".to_string(), current == "0");
+            row = row.child(filter_chip_color(label, on, accent_key, {
+                let ui = ui.clone();
+                let fid = fid.clone();
+                move || ui.search_fid.set(fid.clone())
+            }));
+            for f in ui.settings.get().tabs() {
+                let name = ui
+                    .sections
+                    .with(|sections| {
+                        sections
+                            .iter()
+                            .flat_map(|s| s.forums.iter())
+                            .find(|x| x.fid == f)
+                            .map(|x| x.name.clone())
+                    })
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| forum_name(f).to_string());
+                let fid_str = f.to_string();
+                let on = current == fid_str;
+                let key = accent_key;
+                row = row.child(filter_chip_color(&name, on, key, {
+                    let ui = ui.clone();
+                    let fid = fid_str.clone();
+                    move || ui.search_fid.set(fid.clone())
+                }));
+            }
+            vec![row.into_element()]
+        }))
+        // 时间范围
+        .child(dynamic(move || {
+            let ui = for_time.clone();
+            let current = ui.search_time.get();
+            let accent_key = ui.settings.get().skin.color_key();
+            let mut row = view().flex_row().flex_wrap().gap_2();
+            for time in [
+                SearchTime::All,
+                SearchTime::Day,
+                SearchTime::Week,
+                SearchTime::Month,
+                SearchTime::Year,
+            ] {
+                let on = current == time;
+                let key = accent_key;
+                row = row.child(filter_chip_color(time.label(), on, key, {
+                    let ui = ui.clone();
+                    move || ui.search_time.set(time)
+                }));
+            }
+            vec![row.into_element()]
+        }))
+        .child(primary_button("搜索".into(), move || {
+            let ui = for_go.clone();
+            let query = ui.query.get();
+            let full = ui.search_full_text.get();
+            let fid = ui.search_fid.get();
+            let time = ui.search_time.get();
+            ui.clone().load_list(search_source(&query, full, fid, time));
+        }))
+        // 空态占位：与参考图一致，未搜索时给明确引导。
+        .child(
+            dynamic(move || {
+                let ui = for_go.clone();
+                if ui.feed_rows.with(|r| r.is_empty()) {
+                    vec![
+                        view()
+                            .flex_1()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                text("搜索论坛\n按标题或全文查找帖子，可按版块与时间筛选")
+                                    .text_size(px(14.0))
+                                    .text_color(move || theme().muted_foreground),
+                            )
+                            .into_element(),
+                    ]
+                } else {
+                    Vec::new()
+                }
+            }),
+        )
+}
+
+/// 通用筛选胶囊（默认主色高亮）。
+fn filter_chip(label: &str, on: bool, on_press: impl Fn() + 'static) -> AnyElement {
+    let key = Skin::Classic.color_key();
+    filter_chip_color(label, on, key, on_press)
+}
+
+/// 可指定强调色键的筛选胶囊。
+fn filter_chip_color(
+    label: &str,
+    on: bool,
+    accent_key: &'static str,
+    on_press: impl Fn() + 'static,
+) -> AnyElement {
+    let label = label.to_string();
+    view()
+        .px(px(12.0))
+        .py(px(7.0))
+        .rounded(px(16.0))
+        .border_1()
+        .border_color(move || {
+            if on {
+                theme().color(accent_key).unwrap_or_else(|| theme().primary)
+            } else {
+                theme().muted
+            }
+        })
+        .bg(move || if on { theme().card } else { theme().muted })
+        .active(|s| s.opacity(0.7))
+        .on_press(on_press)
+        .child(
+            text(move || label.clone())
+                .text_size(px(12.5))
+                .text_color(move || {
+                    if on {
+                        theme().color(accent_key).unwrap_or_else(|| theme().primary)
+                    } else {
+                        theme().muted_foreground
+                    }
+                }),
+        )
+        .into_element()
 }
 
 /// 崩溃留痕：panic 默认只打到 stderr，开发宿主被关掉后就没处看了。
@@ -3221,6 +3989,348 @@ fn install_panic_log() {
 #[native_module("hipda-nsh/native")]
 fn native(registry: &mut Registry) {
     registry.register::<App>();
+}
+
+/// 发布新主题：游客先引导登录，已登录打开编辑器。顶栏发布按钮与版块菜单共用。
+fn new_post(ui: Ui) {
+    if !ui.logged_in.get() {
+        ui.clone().require_login();
+        return;
+    }
+    ui.menu_open.set(false);
+    ui.avatar_menu.set(false);
+    ui.compose_mode.set(PostMode::New);
+    ui.compose_subject.set(String::new());
+    ui.editor.set(String::new());
+    ui.tab.set(Tab::Forum);
+    ui.screen.set(Screen::Compose);
+}
+
+/// 是否显示三段顶栏与底部四 Tab。详情 / 设置 / 登录等是主 Tab 的下层界面，
+/// 它们各自有返回栏，不再叠一层全局导航。
+fn is_main_screen(screen: Screen) -> bool {
+    matches!(
+        screen,
+        Screen::Threads | Screen::Feed | Screen::Search | Screen::Hub | Screen::Index
+    )
+}
+
+/// 三段式顶栏：左头像（账号菜单）｜中版块名（切换菜单）｜右发布。
+fn top_bar(ui: Ui) -> AnyElement {
+    let for_avatar = ui.clone();
+    let for_forum = ui.clone();
+    let for_publish = ui.clone();
+    let for_menu_overlay = ui.clone();
+    let for_forum_overlay = ui.clone();
+
+    // 版块名：优先站点返回的名字，兜底内置表。
+    let current_fid = ui.fid.get();
+    let forum_label = ui
+        .sections
+        .with(|sections| {
+            sections
+                .iter()
+                .flat_map(|s| s.forums.iter())
+                .find(|f| f.fid == current_fid)
+                .map(|f| f.name.clone())
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| forum_name(current_fid).to_string());
+
+    let mut root = view()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .px(px(16.0))
+        .py(px(10.0))
+        .gap(px(12.0));
+
+    // ---- 左：头像按钮 ----
+    root = root.child(
+        view()
+            .w(px(34.0))
+            .h(px(34.0))
+            .rounded(px(17.0))
+            .items_center()
+            .justify_center()
+            .active(|s| s.opacity(0.7))
+            .on_press({
+                let ui = for_avatar.clone();
+                move || {
+                    let next = !ui.avatar_menu.get();
+                    ui.avatar_menu.set(next);
+                    ui.forum_menu.set(false);
+                }
+            })
+            .bg(move || theme().primary)
+            .child(
+                text(move || {
+                    let name = for_avatar.username.get();
+                    let c = name.chars().next().unwrap_or('H');
+                    c.to_string()
+                })
+                .text_size(px(15.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(move || theme().primary_foreground),
+            ),
+    );
+
+    // ---- 中：版块名 + 下拉箭头 ----
+    root = root.child(
+        view()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .gap(px(4.0))
+            .active(|s| s.opacity(0.7))
+            .on_press({
+                let ui = for_forum.clone();
+                move || {
+                    let next = !ui.forum_menu.get();
+                    ui.forum_menu.set(next);
+                    ui.avatar_menu.set(false);
+                }
+            })
+            .child(
+                text(move || forum_label.clone())
+                    .text_size(px(16.0))
+                    .font_weight(FontWeight::SEMIBOLD),
+            )
+            .child(icon_secondary(ICON_CHEVRON_DOWN, 16.0)),
+    );
+
+    // ---- 右：发布 ----
+    root = root.child(
+        view()
+            .w(px(34.0))
+            .h(px(34.0))
+            .items_center()
+            .justify_center()
+            .active(|s| s.opacity(0.6))
+            .on_press(move || new_post(for_publish.clone()))
+            .child(icon_secondary(ICON_EDIT, 21.0)),
+    );
+
+    // 头像菜单浮层（用 dynamic 包住，展开时才建节点）。
+    let avatar_ui = for_menu_overlay.clone();
+    let avatar_sheet = dynamic(move || {
+        if !avatar_ui.avatar_menu.get() {
+            return Vec::new();
+        }
+        let ui = avatar_ui.clone();
+        let mut items: Vec<AnyElement> = Vec::new();
+        let logged = ui.logged_in.get();
+        if logged {
+            // 个人主页：需要 uid，未取到时给提示而不是空跳转。
+            let profile_ui = ui.clone();
+            items.push(menu_item("个人主页", None, move || {
+                let ui = profile_ui.clone();
+                ui.avatar_menu.set(false);
+                let uid = ui.profile_uid.get();
+                let name = ui.username.get();
+                if uid.trim().is_empty() {
+                    ui.note("暂时无法取得你的 uid，请稍后重试");
+                } else {
+                    ui.clone().open_profile(uid, name);
+                }
+            }));
+            // 切换 / 添加账号：本客户端单会话，等价于退出后用另一账号登录。
+            let switch_ui = ui.clone();
+            items.push(menu_item("切换账号", None, move || {
+                let ui = switch_ui.clone();
+                ui.avatar_menu.set(false);
+                ui.clone().logout();
+                ui.screen.set(Screen::Login);
+            }));
+            let logout_ui = ui.clone();
+            items.push(menu_item("退出登录", None, move || {
+                logout_ui.clone().logout()
+            }));
+        } else {
+            let login_ui = ui.clone();
+            items.push(menu_item("登录账号", None, move || {
+                let ui = login_ui.clone();
+                ui.avatar_menu.set(false);
+                ui.screen.set(Screen::Login);
+            }));
+        }
+        let settings_ui = ui.clone();
+        items.push(menu_item("设置", None, move || {
+            settings_ui.clone().open_settings()
+        }));
+        vec![
+            overlay()
+                .absolute()
+                .inset_0()
+                .child(
+                    view()
+                        .absolute()
+                        .inset_0()
+                        .on_press(move || ui.avatar_menu.set(false)),
+                )
+                .child(
+                    view()
+                        .absolute()
+                        .inset_0()
+                        .items_start()
+                        .justify_start()
+                        .pt(px(52.0))
+                        .pl(px(12.0))
+                        .child(
+                            view()
+                                .w(px(180.0))
+                                .py(px(6.0))
+                                .rounded(px(10.0))
+                                .border_1()
+                                .border_color(move || theme().muted)
+                                .shadow_lg()
+                                .bg(move || theme().card)
+                                .children(items),
+                        ),
+                )
+                .into_element(),
+        ]
+    });
+
+    // 版块切换菜单：列出默认版面，点一个即加载该版。
+    let forum_ui = for_forum_overlay.clone();
+    let forum_sheet = dynamic(move || {
+        if !forum_ui.forum_menu.get() {
+            return Vec::new();
+        }
+        let ui = forum_ui.clone();
+        let current = ui.fid.get();
+        let mut items: Vec<AnyElement> = Vec::new();
+        for fid in ui.settings.get().tabs() {
+            let label = ui
+                .sections
+                .with(|sections| {
+                    sections
+                        .iter()
+                        .flat_map(|s| s.forums.iter())
+                        .find(|f| f.fid == fid)
+                        .map(|f| f.name.clone())
+                })
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| forum_name(fid).to_string());
+            let ui2 = ui.clone();
+            items.push(menu_item_s(label, Some(fid == current), move || {
+                ui2.forum_menu.set(false);
+                ui2.clone().load_threads(fid, 1);
+            }));
+        }
+        vec![
+            overlay()
+                .absolute()
+                .inset_0()
+                .child(
+                    view()
+                        .absolute()
+                        .inset_0()
+                        .on_press(move || ui.forum_menu.set(false)),
+                )
+                .child(
+                    view()
+                        .absolute()
+                        .inset_0()
+                        .items_start()
+                        .justify_center()
+                        .pt(px(52.0))
+                        .child(
+                            view()
+                                .w(px(200.0))
+                                .py(px(6.0))
+                                .rounded(px(10.0))
+                                .border_1()
+                                .border_color(move || theme().muted)
+                                .shadow_lg()
+                                .bg(move || theme().card)
+                                .children(items),
+                        ),
+                )
+                .into_element(),
+        ]
+    });
+
+    root.child(avatar_sheet).child(forum_sheet).into_element()
+}
+
+/// 底部四标签：论坛 / 消息 / 搜索 / 我的。点击同类标签回到该 Tab 首页并刷新。
+fn bottom_tabs(ui: Ui) -> AnyElement {
+    let active = ui.tab.get();
+    let key = ui.settings.get().skin.color_key();
+
+    let item = |tab: Tab, label: &'static str, icon: &'static str| -> AnyElement {
+        let ui = ui.clone();
+        let on = active == tab;
+        let key = key;
+        view()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .gap(px(2.0))
+            .py(px(8.0))
+            .active(|s| s.opacity(0.6))
+            .on_press(move || {
+                let ui = ui.clone();
+                ui.tab.set(tab);
+                match tab {
+                    Tab::Forum => {
+                        // 点论坛 = 刷新当前版块第 1 页；首次进入用默认版块。
+                        let fid = ui.fid.get();
+                        ui.clone().load_threads(fid, 1);
+                    }
+                    Tab::Message => {
+                        ui.clone().load_list(ListSource::Notifications);
+                    }
+                    Tab::Search => {
+                        ui.search_full_text.set(ui.settings.get().search_full_text);
+                        ui.search_fid.set(ui.settings.get().search_fid.clone());
+                        ui.search_time.set(ui.settings.get().search_time);
+                        ui.open_search();
+                    }
+                    Tab::Mine => {
+                        ui.screen.set(Screen::Hub);
+                    }
+                }
+            })
+            .child(
+                svg(nsh_core::element::ImageSrc::svg_markup(icon))
+                    .w(px(22.0))
+                    .h(px(22.0))
+                    .tint_color(move || {
+                        if on {
+                            theme().color(key).unwrap_or_else(|| theme().primary)
+                        } else {
+                            theme().muted_foreground
+                        }
+                    }),
+            )
+            .child(
+                text(label)
+                    .text_size(px(10.5))
+                    .text_color(move || {
+                        if on {
+                            theme().color(key).unwrap_or_else(|| theme().primary)
+                        } else {
+                            theme().muted_foreground
+                        }
+                    }),
+            )
+            .into_element()
+    };
+
+    view()
+        .flex_row()
+        .items_center()
+        .py(px(4.0))
+        .border_1()
+        .border_color(move || theme().muted)
+        .bg(move || theme().card)
+        .child(item(Tab::Forum, "论坛", ICON_HOME))
+        .child(item(Tab::Message, "消息", ICON_MAIL))
+        .child(item(Tab::Search, "搜索", ICON_SEARCH))
+        .child(item(Tab::Mine, "我的", ICON_PERSON))
 }
 
 /// HiPDA·nsh 版 —— HiPDA 论坛的非官方客户端。
@@ -3284,9 +4394,9 @@ pub fn App() -> impl IntoElement {
     {
         ui.clone().open_thread(tid.trim().to_string(), String::new());
     }
-    let for_header = ui.clone();
     let for_body = ui.clone();
     let for_footer = ui.clone();
+    let for_chrome = ui.clone();
 
     view()
         .flex_1()
@@ -3296,65 +4406,16 @@ pub fn App() -> impl IntoElement {
             view()
                 .flex_1()
                 .p_safe_area()
-                .child(
-                    view()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .px_5()
-                        .py_3()
-                        // 这里是工具条，不是标题：app 名降为 14/600，
-                        // 页面标题交给下方的「论坛首页」承担，避免两个 18pt 抢主次。
-                        .child(
-                            text("HiPDA·nsh 版")
-                                .text_size(px(14.0))
-                                .font_weight(FontWeight::SEMIBOLD),
-                        )
-                        // 登录状态与操作放同一行，不再上下两行错位。
-                        .child(dynamic(move || {
-                            let ui = for_header.clone();
-                            let logged = ui.logged_in.get();
-                            let name = ui.username.get();
-                            let label = if !logged {
-                                "未登录".to_string()
-                            } else if name.is_empty() {
-                                "已登录".to_string()
-                            } else {
-                                format!("已登录 · {name}")
-                            };
-                            // 设置入口放在顶栏，任何界面都能进；不带文字省横向空间。
-                            let gear_ui = ui.clone();
-                            let gear = ghost_button_icon(ICON_GEAR, "设置".into(), move || {
-                                gear_ui.clone().open_settings()
-                            });
-                            let action_ui = ui.clone();
-                            let action = if logged {
-                                ghost_button_icon(ICON_LOGOUT, "退出".into(), move || {
-                                    action_ui.clone().logout()
-                                })
-                                .into_element()
-                            } else {
-                                ghost_button("登录".into(), move || {
-                                    action_ui.screen.set(Screen::Login)
-                                })
-                                .into_element()
-                            };
-                            vec![
-                                view()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap(px(10.0))
-                                    .child(
-                                        text(move || label.clone())
-                                            .text_size(px(11.5))
-                                            .text_color(move || theme().muted_foreground),
-                                    )
-                                    .child(gear)
-                                    .child(action)
-                                    .into_element(),
-                            ]
-                        })),
-                )
+                // 主 Tab 页：三段顶栏 + 底部四 Tab；下层页面（详情 / 设置等）
+                // 由各自顶栏负责，这里只留内容，避免两层导航叠加。
+                .child(dynamic(move || {
+                    let ui = for_chrome.clone();
+                    if is_main_screen(ui.screen.get()) {
+                        vec![top_bar(ui.clone()).into_element()]
+                    } else {
+                        vec![view().h(px(0.0)).into_element()]
+                    }
+                }))
                 .child(
                     view()
                         .flex_1()
@@ -3373,16 +4434,24 @@ pub fn App() -> impl IntoElement {
                             Screen::Settings => settings_view(for_body.clone()).into_element(),
                         })),
                 )
+                // 底部四 Tab：只在主 Tab 页显示。
+                .child(dynamic(move || {
+                    let ui = for_chrome.clone();
+                    if is_main_screen(ui.screen.get()) {
+                        vec![bottom_tabs(ui.clone()).into_element()]
+                    } else {
+                        Vec::new()
+                    }
+                }))
                 .child(
                     view()
                         .px(px(16.0))
-                        .py(px(8.0))
-                        .bg(move || theme().muted)
+                        .py(px(5.0))
                         .child(text(move || {
                             let busy = if for_footer.busy.get() { " · 加载中" } else { "" };
                             format!("{}{busy}", for_footer.status.get())
                         })
-                        .text_size(px(11.0))
+                        .text_size(px(10.5))
                         .text_color(move || theme().muted_foreground)),
                 ),
         )
@@ -3421,58 +4490,135 @@ fn hub_open(ui: Ui, i: usize) {
 }
 
 fn hub_view(ui: Ui) -> impl IntoElement {
-    let for_home = ui.clone();
-    let for_rows = ui.clone();
-    view()
+    let for_account = ui.clone();
+    let for_fav = ui.clone();
+    let for_later = ui.clone();
+    let for_history = ui.clone();
+    let for_posts = ui.clone();
+    let for_replies = ui.clone();
+    let for_draft = ui.clone();
+    let for_follow = ui.clone();
+    let for_settings = ui.clone();
+    let for_login = ui.clone();
+    let key = ui.settings.get().skin.color_key();
+
+    scroll()
         .flex_1()
-        .gap_3()
-        .px_4()
-        .py_3()
         .child(
             view()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(ghost_button_icon(ICON_HOME, "首页".into(), move || {
-                    for_home.screen.set(Screen::Index)
-                }))
-                .child(text("我的空间").text_size(px(20.0)).font_weight(FontWeight::BOLD).flex_1()),
-        )
-        .child(
-            text(move || {
-                if ui.logged_in.get() {
-                    "已登录 · 选择要查看的内容".to_string()
-                } else {
-                    "游客可搜索与浏览最新帖子；私信、收藏、黑名单等需要登录".to_string()
-                }
-            })
-            .text_size(px(12.0))
-            .text_color(move || theme().muted_foreground),
-        )
-        .child(
-            virtual_list(HUB_COUNT, move |at| {
-                let ui = for_rows.clone();
-                view()
-                    .gap_1()
-                    .px_4()
-                    .py_3()
-                    .min_h(px(56.0))
-                    .rounded(px(12.0))
-                    .bg(move || theme().secondary)
-                    .active(|s| s.opacity(0.6))
-                    .on_press(move || hub_open(ui.clone(), at.index()))
-                    .child(
-                        text(move || hub_entry(at.index()).0.to_string())
-                            .font_weight(FontWeight::MEDIUM),
-                    )
-                    .child(
-                        text(move || hub_entry(at.index()).1.to_string())
-                            .text_size(px(12.0))
-                            .text_color(move || theme().muted_foreground),
-                    )
-            })
-            .estimated_item_size(px(64.0))
-            .flex_1(),
+                .flex_1()
+                .gap(px(16.0))
+                .child(text("我的").text_size(px(20.0)).font_weight(FontWeight::BOLD))
+                // 账号卡片
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(12.0))
+                        .px(px(16.0))
+                        .py(px(14.0))
+                        .rounded(px(12.0))
+                        .bg(move || theme().card)
+                        .child(
+                            view()
+                                .w(px(44.0))
+                                .h(px(44.0))
+                                .rounded(px(10.0))
+                                .items_center()
+                                .justify_center()
+                                .bg(move || theme().color(key).unwrap_or_else(|| theme().primary))
+                                .child(
+                                    text("H")
+                                        .text_size(px(20.0))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(move || theme().primary_foreground),
+                                ),
+                        )
+                        .child(
+                            view()
+                                .flex_1()
+                                .gap(px(3.0))
+                                .child(dynamic(move || {
+                                    let ui = for_account.clone();
+                                    let name = ui.username.get();
+                                    let title = if ui.logged_in.get() {
+                                        if name.is_empty() { "已登录".to_string() } else { name }
+                                    } else {
+                                        "未登录".to_string()
+                                    };
+                                    vec![
+                                        text(move || title.clone())
+                                            .text_size(px(15.0))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .into_element(),
+                                        text("HiPDA 论坛账号")
+                                            .text_size(px(11.5))
+                                            .text_color(move || theme().muted_foreground)
+                                            .into_element(),
+                                    ]
+                                })),
+                        )
+                        .child(dynamic(move || {
+                            let ui = for_login.clone();
+                            if ui.logged_in.get() {
+                                Vec::new()
+                            } else {
+                                vec![ghost_button("登录".into(), move || {
+                                    for_login.screen.set(Screen::Login)
+                                })
+                                .into_element()]
+                            }
+                        })),
+                )
+                // 收藏 / 稍后读 / 浏览历史
+                .child(settings_group(
+                    String::new(),
+                    vec![
+                        nav_row("收藏".into(), "我收藏的主题".into(), move || {
+                            for_fav.clone().load_list(ListSource::Favorites { page: 1 })
+                        }),
+                        nav_row("稍后读".into(), "关注的主题".into(), move || {
+                            for_later.clone().load_list(ListSource::Attention { page: 1 })
+                        }),
+                        nav_row("浏览历史".into(), "本次打开过的主题".into(), move || {
+                            let ui = for_history.clone();
+                            let n = ui.read_tids.with(|s| s.len());
+                            ui.note(format!("本次会话已浏览 {n} 个主题"));
+                        }),
+                    ],
+                ))
+                // 我的帖子 / 我的回复 / 草稿 / 关注的人
+                .child(settings_group(
+                    String::new(),
+                    vec![
+                        nav_row("我的帖子".into(), "我发起的主题".into(), move || {
+                            for_posts.clone().load_list(ListSource::MyPosts { page: 1 })
+                        }),
+                        nav_row("我的回复".into(), "我参与过的主题".into(), move || {
+                            for_replies.clone().load_list(ListSource::MyReplies { page: 1 })
+                        }),
+                        nav_row("草稿".into(), "未发出的回帖内容".into(), move || {
+                            let ui = for_draft.clone();
+                            let text = session::draft();
+                            ui.editor.set(text.clone());
+                            if text.trim().is_empty() {
+                                ui.note("当前没有草稿");
+                            } else {
+                                ui.note("草稿已载入回帖编辑器");
+                                ui.screen.set(Screen::Detail);
+                            }
+                        }),
+                        nav_row("关注的人".into(), "我的关注列表".into(), move || {
+                            for_follow.clone().load_list(ListSource::Attention { page: 1 })
+                        }),
+                    ],
+                ))
+                .child(settings_group(
+                    String::new(),
+                    vec![nav_row("设置".into(), String::new(), move || {
+                        for_settings.clone().open_settings()
+                    })],
+                )),
         )
 }
 
@@ -3586,6 +4732,9 @@ fn blacklist_row(ui: Ui, at: Position) -> impl IntoElement {
 enum SettingsPage {
     #[default]
     Menu,
+    Appearance,
+    ThreadList,
+    Reading,
     Forum,
     Ui,
     Notify,
@@ -3597,6 +4746,9 @@ impl SettingsPage {
     fn title(self) -> &'static str {
         match self {
             Self::Menu => "设置",
+            Self::Appearance => "外观",
+            Self::ThreadList => "帖子列表",
+            Self::Reading => "阅读与回复",
             Self::Forum => "论坛选项",
             Self::Ui => "用户界面",
             Self::Notify => "消息通知",
@@ -3760,6 +4912,27 @@ fn settings_group(title: String, rows: Vec<AnyElement>) -> AnyElement {
     }
 }
 
+/// 一段横向档位选择器，包成设置行（左标题说明 + 右档位胶囊）。
+fn chip_picker_row(label: String, desc: String, chips: AnyElement) -> AnyElement {
+    setting_row(label, desc, chips)
+}
+
+/// 「恢复默认」按钮行。接受一个闭包，由页面决定重置哪些字段。
+fn restore_default_row(on_press: impl Fn() + 'static) -> AnyElement {
+    view()
+        .py(px(12.0))
+        .items_center()
+        .justify_center()
+        .active(|s| s.opacity(0.6))
+        .on_press(on_press)
+        .child(
+            text("恢复默认")
+                .text_size(px(13.0))
+                .text_color(move || theme().destructive),
+        )
+        .into_element()
+}
+
 /// 字号选择的一段。
 fn scale_chip(
     current: settings::TextScale,
@@ -3811,6 +4984,28 @@ fn menu_item(
         .into_element()
 }
 
+/// 与 menu_item 相同，但标签是运行时字符串（版块名）。
+fn menu_item_s(
+    label: String,
+    checked: Option<bool>,
+    on_press: impl Fn() + 'static,
+) -> AnyElement {
+    view()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .px(px(14.0))
+        .py(px(10.0))
+        .active(|s| s.opacity(0.6))
+        .on_press(on_press)
+        .child(text(move || label.clone()).text_size(px(13.5)))
+        .child(dynamic(move || match checked {
+            Some(true) => vec![icon_secondary(ICON_CHECK, 14.0).into_element()],
+            _ => Vec::new(),
+        }))
+        .into_element()
+}
+
 fn settings_view(ui: Ui) -> impl IntoElement {
     let for_back = ui.clone();
     let for_title = ui.clone();
@@ -3846,6 +5041,9 @@ fn settings_view(ui: Ui) -> impl IntoElement {
             let ui = for_body.clone();
             vec![match ui.settings_page.get() {
                 SettingsPage::Menu => settings_menu(ui.clone()),
+                SettingsPage::Appearance => settings_appearance_page(ui.clone()),
+                SettingsPage::ThreadList => settings_thread_list_page(ui.clone()),
+                SettingsPage::Reading => settings_reading_page(ui.clone()),
                 SettingsPage::Forum => settings_forum_page(ui.clone()),
                 SettingsPage::Ui => settings_ui_page(ui.clone()),
                 SettingsPage::Notify => settings_notify_page(ui.clone()),
@@ -3857,66 +5055,55 @@ fn settings_view(ui: Ui) -> impl IntoElement {
 
 /// 顶层菜单：三条信息 + 分类设置五个入口。
 fn settings_menu(ui: Ui) -> AnyElement {
-    let for_release = ui.clone();
-    let for_about = ui.clone();
+    let for_appearance = ui.clone();
+    let for_list = ui.clone();
+    let for_reading = ui.clone();
     let for_forum = ui.clone();
     let for_ui = ui.clone();
     let for_notify = ui.clone();
     let for_network = ui.clone();
     let for_other = ui.clone();
 
-    let info = settings_group(
-        String::new(),
+    let s = ui.settings.get();
+    let read_group = settings_group(
+        "显示与阅读".into(),
         vec![
-            nav_row(
-                "客户端发布帖".into(),
-                "反馈问题、最新动态，请来这里".into(),
-                move || {
-                    let ui = for_release.clone();
-                    ui.query.set("HiPDA·nsh".into());
-                    ui.open_search();
-                },
-            ),
-            nav_row(
-                format!("关于 {}", env!("CARGO_PKG_NAME")),
-                env!("CARGO_PKG_VERSION").into(),
-                move || for_about.settings_page.set(SettingsPage::Other),
-            ),
-            info_row(
-                "检查更新".into(),
-                "本客户端跟随代码仓库发版，没有在线更新".into(),
-            ),
+            nav_row("外观".into(), s.skin.label().into(), move || {
+                for_appearance.settings_page.set(SettingsPage::Appearance)
+            }),
+            nav_row("帖子列表".into(), s.list_style.label().into(), move || {
+                for_list.settings_page.set(SettingsPage::ThreadList)
+            }),
+            nav_row("阅读与回复".into(), "平铺 · 分页".into(), move || {
+                for_reading.settings_page.set(SettingsPage::Reading)
+            }),
         ],
     );
 
-    let categories = settings_group(
-        "分类设置".into(),
+    let forum_group = settings_group(
+        "版块与首页".into(),
         vec![
-            nav_row(
-                "论坛选项".into(),
-                "版面选择、小尾巴、黑名单".into(),
-                move || for_forum.settings_page.set(SettingsPage::Forum),
-            ),
-            nav_row(
-                "用户界面".into(),
-                "正文字号、头像".into(),
-                move || for_ui.settings_page.set(SettingsPage::Ui),
-            ),
-            nav_row(
-                "消息通知".into(),
-                "本客户端不常驻后台".into(),
-                move || for_notify.settings_page.set(SettingsPage::Notify),
-            ),
-            nav_row(
-                "图片与缓存".into(),
-                "正文图片、缓存说明".into(),
-                move || for_network.settings_page.set(SettingsPage::Network),
-            ),
-            nav_row(
-                "其它".into(),
-                "服务器、草稿、版本".into(),
-                move || for_other.settings_page.set(SettingsPage::Other),
-            ),
+            nav_row("论坛选项".into(), format!("{} 个常用版块", s.tabs().len()), move || {
+                for_forum.settings_page.set(SettingsPage::Forum)
+            }),
+            nav_row("用户界面".into(), "正文字号、头像".into(), move || {
+                for_ui.settings_page.set(SettingsPage::Ui)
+            }),
+        ],
+    );
+
+    let general_group = settings_group(
+        "通用".into(),
+        vec![
+            nav_row("消息通知".into(), "本客户端不常驻后台".into(), move || {
+                for_notify.settings_page.set(SettingsPage::Notify)
+            }),
+            nav_row("图片与缓存".into(), "正文图片、缓存说明".into(), move || {
+                for_network.settings_page.set(SettingsPage::Network)
+            }),
+            nav_row("其它".into(), "服务器、草稿、版本".into(), move || {
+                for_other.settings_page.set(SettingsPage::Other)
+            }),
         ],
     );
 
@@ -3926,8 +5113,9 @@ fn settings_menu(ui: Ui) -> AnyElement {
             view()
                 .w_full()
                 .gap(px(20.0))
-                .child(info)
-                .child(categories),
+                .child(read_group)
+                .child(forum_group)
+                .child(general_group),
         )
         .into_element()
 }
@@ -4074,6 +5262,320 @@ fn settings_forum_page(ui: Ui) -> AnyElement {
 }
 
 /// 用户界面：正文字号 + 头像。
+/// 外观：主题皮肤 + 强调色 + 跟随系统字号 + 分隔线深浅。
+/// 明暗模式由 NSH 的 nsh.json 决定（跟随系统），运行时切换不在 NSH 能力内，
+/// 因此这里不摆假开关，而是用经典皮肤真实切换强调色。
+fn settings_appearance_page(ui: Ui) -> AnyElement {
+    let body = dynamic(move || {
+        let ui = ui.clone();
+        let s = ui.settings.get();
+        let key = s.skin.color_key();
+        let mut rows: Vec<AnyElement> = Vec::new();
+
+        let mut chips = view().flex_row().flex_wrap().gap(px(6.0));
+        for skin in [
+            Skin::Classic,
+            Skin::Forest,
+            Skin::Amber,
+            Skin::Violet,
+            Skin::Graphite,
+        ] {
+            let pick = ui.clone();
+            chips = chips.child(filter_chip_color(skin.label(), s.skin == skin, key, move || {
+                pick.clone().apply_settings(|x| x.skin = skin);
+            }));
+        }
+        rows.push(chip_picker_row(
+            "主题".into(),
+            "五套经典配色，即时生效".into(),
+            chips.into_element(),
+        ));
+        rows.push(info_row(
+            "强调色".into(),
+            "随主题自动变化（当前：".to_string() + s.skin.label() + "）",
+        ));
+
+        let font_ui = ui.clone();
+        let follow = s.follow_system_font;
+        rows.push(toggle_row(
+            follow,
+            "跟随系统文字大小".into(),
+            "关闭后可用正文字号单独调节".into(),
+            move || {
+                font_ui
+                    .clone()
+                    .apply_settings(|x| x.follow_system_font = !follow);
+            },
+        ));
+
+        let mut chips = view().flex_row().gap(px(6.0));
+        for d in [Divider::None, Divider::Light, Divider::Medium, Divider::Strong] {
+            let pick = ui.clone();
+            chips = chips.child(filter_chip_color(d.label(), s.divider == d, key, move || {
+                pick.clone().apply_settings(|x| x.divider = d);
+            }));
+        }
+        rows.push(chip_picker_row(
+            "分隔线".into(),
+            "列表与正文分隔线的深浅".into(),
+            chips.into_element(),
+        ));
+
+        let group = settings_group(String::new(), rows);
+        let reset_ui = ui.clone();
+        vec![
+            group,
+            settings_group(
+                String::new(),
+                vec![restore_default_row(move || {
+                    reset_ui.clone().apply_settings(|x| {
+                        let d = Settings::default();
+                        x.skin = d.skin;
+                        x.follow_system_font = d.follow_system_font;
+                        x.divider = d.divider;
+                    });
+                })],
+            ),
+        ]
+    });
+    scroll()
+        .flex_1()
+        .child(view().w_full().gap(px(20.0)).child(body))
+        .into_element()
+}
+
+/// 帖子列表：排版样式 / 头像三件套 / 已读淡化 / 显示选项。
+fn settings_thread_list_page(ui: Ui) -> AnyElement {
+    let body = dynamic(move || {
+        let ui = ui.clone();
+        let s = ui.settings.get();
+        let key = s.skin.color_key();
+        let mut rows: Vec<AnyElement> = Vec::new();
+
+        let mut chips = view().flex_row().gap(px(6.0));
+        for style in [ListStyle::LargeAvatar, ListStyle::SmallAvatar, ListStyle::NoAvatar] {
+            let pick = ui.clone();
+            chips = chips.child(filter_chip_color(style.label(), s.list_style == style, key, move || {
+                pick.clone().apply_settings(|x| x.list_style = style);
+            }));
+        }
+        rows.push(chip_picker_row(
+            "排版样式".into(),
+            "列表行的头像排布".into(),
+            chips.into_element(),
+        ));
+
+        let mut chips = view().flex_row().gap(px(6.0));
+        for size in [AvatarSize::Small, AvatarSize::Medium, AvatarSize::Large] {
+            let pick = ui.clone();
+            chips = chips.child(filter_chip_color(size.label(), s.avatar_size == size, key, move || {
+                pick.clone().apply_settings(|x| x.avatar_size = size);
+            }));
+        }
+        rows.push(chip_picker_row(
+            "头像大小".into(),
+            String::new(),
+            chips.into_element(),
+        ));
+
+        let mut chips = view().flex_row().gap(px(6.0));
+        for shape in [AvatarShape::Round, AvatarShape::Square] {
+            let pick = ui.clone();
+            chips = chips.child(filter_chip_color(shape.label(), s.avatar_shape == shape, key, move || {
+                pick.clone().apply_settings(|x| x.avatar_shape = shape);
+            }));
+        }
+        rows.push(chip_picker_row(
+            "头像形状".into(),
+            String::new(),
+            chips.into_element(),
+        ));
+
+        let mut chips = view().flex_row().flex_wrap().gap(px(6.0));
+        for mode in [
+            DefaultAvatar::Initial,
+            DefaultAvatar::Pixel,
+            DefaultAvatar::InitialLight,
+        ] {
+            let pick = ui.clone();
+            chips = chips.child(filter_chip_color(mode.label(), s.default_avatar == mode, key, move || {
+                pick.clone().apply_settings(|x| x.default_avatar = mode);
+            }));
+        }
+        rows.push(chip_picker_row(
+            "默认头像".into(),
+            "用户未上传头像时显示".into(),
+            chips.into_element(),
+        ));
+
+        let mut chips = view().flex_row().flex_wrap().gap(px(6.0));
+        for fade in [ReadFade::Light, ReadFade::Heavy, ReadFade::None] {
+            let pick = ui.clone();
+            chips = chips.child(filter_chip_color(fade.label(), s.read_fade == fade, key, move || {
+                pick.clone().apply_settings(|x| x.read_fade = fade);
+            }));
+        }
+        rows.push(chip_picker_row(
+            "已读帖子标题".into(),
+            String::new(),
+            chips.into_element(),
+        ));
+
+        let alt_ui = ui.clone();
+        let alt = s.alternating_rows;
+        rows.push(toggle_row(
+            alt,
+            "交替行底色".into(),
+            "相邻帖子用不同底色区分".into(),
+            move || {
+                alt_ui
+                    .clone()
+                    .apply_settings(|x| x.alternating_rows = !alt);
+            },
+        ));
+        let mark_ui = ui.clone();
+        let mark = s.new_reply_mark;
+        rows.push(toggle_row(
+            mark,
+            "新回复标记".into(),
+            "显示回复数胶囊".into(),
+            move || {
+                mark_ui
+                    .clone()
+                    .apply_settings(|x| x.new_reply_mark = !mark);
+            },
+        ));
+        let dot_ui = ui.clone();
+        let dot = s.unread_dot;
+        rows.push(toggle_row(
+            dot,
+            "未读帖子显示圆点".into(),
+            String::new(),
+            move || {
+                dot_ui
+                    .clone()
+                    .apply_settings(|x| x.unread_dot = !dot);
+            },
+        ));
+        let last_ui = ui.clone();
+        let last = s.show_last_reply;
+        rows.push(toggle_row(
+            last,
+            "显示最后回复人".into(),
+            String::new(),
+            move || {
+                last_ui
+                    .clone()
+                    .apply_settings(|x| x.show_last_reply = !last);
+            },
+        ));
+
+        let group = settings_group(String::new(), rows);
+        let reset_ui = ui.clone();
+        vec![
+            group,
+            settings_group(
+                String::new(),
+                vec![restore_default_row(move || {
+                    reset_ui.clone().apply_settings(|x| {
+                        let d = Settings::default();
+                        x.list_style = d.list_style;
+                        x.avatar_size = d.avatar_size;
+                        x.avatar_shape = d.avatar_shape;
+                        x.default_avatar = d.default_avatar;
+                        x.read_fade = d.read_fade;
+                        x.alternating_rows = d.alternating_rows;
+                        x.new_reply_mark = d.new_reply_mark;
+                        x.unread_dot = d.unread_dot;
+                        x.show_last_reply = d.show_last_reply;
+                    });
+                })],
+            ),
+        ]
+    });
+    scroll()
+        .flex_1()
+        .child(view().w_full().gap(px(20.0)).child(body))
+        .into_element()
+}
+
+/// 阅读与回复：标题字号 / 字重 / 间距 / 正文字号。
+fn settings_reading_page(ui: Ui) -> AnyElement {
+    let body = dynamic(move || {
+        let ui = ui.clone();
+        let s = ui.settings.get();
+        let key = s.skin.color_key();
+        let mut rows: Vec<AnyElement> = Vec::new();
+
+        let mut chips = view().flex_row().gap(px(6.0));
+        for size in [TitleSize::Small, TitleSize::Medium, TitleSize::Large, TitleSize::ExtraLarge] {
+            let pick = ui.clone();
+            chips = chips.child(filter_chip_color(size.label(), s.title_size == size, key, move || {
+                pick.clone().apply_settings(|x| x.title_size = size);
+            }));
+        }
+        rows.push(chip_picker_row("字号".into(), "列表标题字号".into(), chips.into_element()));
+
+        let mut chips = view().flex_row().gap(px(6.0));
+        for w in [TitleWeight::Regular, TitleWeight::Medium, TitleWeight::Semibold, TitleWeight::Bold] {
+            let pick = ui.clone();
+            chips = chips.child(filter_chip_color(w.label(), s.title_weight == w, key, move || {
+                pick.clone().apply_settings(|x| x.title_weight = w);
+            }));
+        }
+        rows.push(chip_picker_row("字重".into(), "列表标题粗细".into(), chips.into_element()));
+
+        let mut chips = view().flex_row().flex_wrap().gap(px(6.0));
+        for sp in [Spacing::Tight, Spacing::Normal, Spacing::Relaxed, Spacing::Loose] {
+            let pick = ui.clone();
+            chips = chips.child(filter_chip_color(sp.label(), s.spacing == sp, key, move || {
+                pick.clone().apply_settings(|x| x.spacing = sp);
+            }));
+        }
+        rows.push(chip_picker_row("间距".into(), "列表行距，可逐档调节".into(), chips.into_element()));
+
+        let mut body_chips = view()
+            .flex_row()
+            .gap(px(2.0))
+            .p(px(2.0))
+            .rounded(px(8.0))
+            .bg(move || theme().muted);
+        for mine in [TextScale::Small, TextScale::Normal, TextScale::Large] {
+            let pick = ui.clone();
+            body_chips = body_chips.child(scale_chip(s.text_scale, mine, move || {
+                pick.clone().apply_settings(|x| x.text_scale = mine);
+            }));
+        }
+        rows.push(chip_picker_row(
+            "正文字号".into(),
+            "帖子正文大小".into(),
+            body_chips.into_element(),
+        ));
+
+        let group = settings_group(String::new(), rows);
+        let reset_ui = ui.clone();
+        vec![
+            group,
+            settings_group(
+                String::new(),
+                vec![restore_default_row(move || {
+                    reset_ui.clone().apply_settings(|x| {
+                        let d = Settings::default();
+                        x.title_size = d.title_size;
+                        x.title_weight = d.title_weight;
+                        x.spacing = d.spacing;
+                        x.text_scale = d.text_scale;
+                    });
+                })],
+            ),
+        ]
+    });
+    scroll()
+        .flex_1()
+        .child(view().w_full().gap(px(20.0)).child(body))
+        .into_element()
+}
+
 fn settings_ui_page(ui: Ui) -> AnyElement {
     let for_reading = ui.clone();
     let reading = dynamic(move || {

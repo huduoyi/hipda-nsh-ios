@@ -75,6 +75,23 @@ pub fn detail_key(tid: &str, page: i32) -> String {
     format!("detail:{tid}:{page}")
 }
 
+/// 浏览进度的存储键前缀。进度和「内容缓存」分开：它要长期保留（重开 App
+/// 也能回到上次读到的楼层），不参与内容缓存的 24 条上限与一天过期。
+const PROGRESS_PREFIX: &str = "hipda.progress.v1.";
+
+/// 读单个主题的浏览进度。返回 `(进度, 存储时间)`。
+pub fn get_progress<T: DeserializeOwned>(tid: &str) -> Option<T> {
+    let raw = Storage::get_item(&format!("{PROGRESS_PREFIX}{tid}"))?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// 写单个主题的浏览进度。写失败只影响「下次能否恢复位置」，不影响浏览本身。
+pub fn put_progress<T: Serialize>(tid: &str, value: &T) {
+    if let Ok(raw) = serde_json::to_string(value) {
+        let _ = Storage::set_item(&format!("{PROGRESS_PREFIX}{tid}"), raw);
+    }
+}
+
 /// 读缓存。返回 `(值, 存了多久)`；年龄让界面能说明「这是多久前的数据」。
 pub fn get<T: DeserializeOwned>(key: &str) -> Option<(T, u64)> {
     let now = now_secs();

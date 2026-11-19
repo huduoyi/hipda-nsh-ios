@@ -300,6 +300,7 @@ impl<T: Transport> ForumClient<T> {
                 ("srchtxt", q.as_str()),
                 ("srchuname", a.as_str()),
                 ("fid", fid),
+                ("srchfrom", "0"),
             ],
         );
         if page > 1 {

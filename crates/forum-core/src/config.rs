@@ -168,7 +168,7 @@ impl Endpoints {
             new_sms: format!("{b}pm.php?filter=newpm"),
             clear_sms: format!("{b}pm.php?action=del&uid={{uid}}&filter=privatepm"),
             upload_image: format!("{b}misc.php?action=swfupload&operation=upload&simple=1&type=image"),
-            search: format!("{b}search.php?srchtype={{srchtype}}&srchtxt={{srchtxt}}&searchsubmit=true&st=on&srchuname={{srchuname}}&srchfilter=all&srchfrom=0&before=&orderby=lastpost&ascdesc=desc&srchfid%5B0%5D={{fid}}"),
+            search: format!("{b}search.php?srchtype={{srchtype}}&srchtxt={{srchtxt}}&searchsubmit=true&st=on&srchuname={{srchuname}}&srchfilter=all&srchfrom={{srchfrom}}&before=&orderby=lastpost&ascdesc=desc&srchfid%5B0%5D={{fid}}"),
             search_user_thread: format!("{b}search.php?srchfid=all&srchfrom=0&searchsubmit=yes&srchuid={{srchuid}}"),
             search_by_id: format!("{b}search.php?searchid={{searchid}}&orderby=lastpost&ascdesc=desc&searchsubmit=yes"),
             new_posts: format!("{b}search.php?srchfrom=86400&searchsubmit=yes"),
