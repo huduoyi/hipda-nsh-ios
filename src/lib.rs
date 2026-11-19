@@ -3069,20 +3069,20 @@ fn detail_nav_bar(ui: Ui) -> impl IntoElement {
                 }))
                 // 页码输入 + 跳转
                 .child(
-                    field(
-                        "页",
-                        move || for_page_val.detail_jump_page.get(),
-                        move |v| page_change.detail_jump_page.set(v),
-                        move |v| {
-                            if let Ok(p) = v.trim().parse::<i32>() {
-                                jump_page.detail_goto_page(p);
-                            }
-                        },
-                        AutoFill::Off,
-                        false,
-                    )
-                    .w(px(52.0))
-                    .min_h(px(34.0)),
+                    view().w(px(52.0)).child(
+                        field(
+                            "页",
+                            move || for_page_val.detail_jump_page.get(),
+                            move |v| page_change.detail_jump_page.set(v),
+                            move |v| {
+                                if let Ok(p) = v.trim().parse::<i32>() {
+                                    jump_page.detail_goto_page(p);
+                                }
+                            },
+                            AutoFill::Off,
+                            false,
+                        ),
+                    ),
                 )
                 .child(ghost_button("跳页".into(), move || {
                     let v = page_go.detail_jump_page.get();
@@ -3102,20 +3102,20 @@ fn detail_nav_bar(ui: Ui) -> impl IntoElement {
                 .child(ghost_button("页尾".into(), move || bottom.detail_scroll_bottom()))
                 // 楼层输入 + 跳转
                 .child(
-                    field(
-                        "楼层",
-                        move || for_floor_val.detail_jump_floor.get(),
-                        move |v| floor_change.detail_jump_floor.set(v),
-                        move |v| {
-                            if let Ok(f) = v.trim().parse::<i32>() {
-                                jump_floor.detail_goto_floor(f);
-                            }
-                        },
-                        AutoFill::Off,
-                        false,
-                    )
-                    .w(px(60.0))
-                    .min_h(px(34.0)),
+                    view().w(px(60.0)).child(
+                        field(
+                            "楼层",
+                            move || for_floor_val.detail_jump_floor.get(),
+                            move |v| floor_change.detail_jump_floor.set(v),
+                            move |v| {
+                                if let Ok(f) = v.trim().parse::<i32>() {
+                                    jump_floor.detail_goto_floor(f);
+                                }
+                            },
+                            AutoFill::Off,
+                            false,
+                        ),
+                    ),
                 )
                 .child(ghost_button("跳楼".into(), move || {
                     let v = floor_go.detail_jump_floor.get();
@@ -3229,7 +3229,7 @@ fn detail_view(ui: Ui) -> impl IntoElement {
                 })
                 .on_scroll_end({
                     let ui = ui.clone();
-                    move |_| {
+                    move |_: &nsh_core::Point<nsh_core::Points>| {
                         ui.save_detail_progress();
                     }
                 })
@@ -3758,6 +3758,7 @@ fn search_view(ui: Ui) -> impl IntoElement {
     let for_input = ui.clone();
     let for_submit = ui.clone();
     let for_go = ui.clone();
+    let for_empty = ui.clone();
     let for_scope = ui.clone();
     let for_fid = ui.clone();
     let for_time = ui.clone();
@@ -3893,7 +3894,7 @@ fn search_view(ui: Ui) -> impl IntoElement {
         // 空态占位：与参考图一致，未搜索时给明确引导。
         .child(
             dynamic(move || {
-                let ui = for_go.clone();
+                let ui = for_empty.clone();
                 if ui.feed_rows.with(|r| r.is_empty()) {
                     vec![
                         view()
@@ -4331,6 +4332,7 @@ fn bottom_tabs(ui: Ui) -> AnyElement {
         .child(item(Tab::Message, "消息", ICON_MAIL))
         .child(item(Tab::Search, "搜索", ICON_SEARCH))
         .child(item(Tab::Mine, "我的", ICON_PERSON))
+        .into_element()
 }
 
 /// HiPDA·nsh 版 —— HiPDA 论坛的非官方客户端。
@@ -4397,6 +4399,7 @@ pub fn App() -> impl IntoElement {
     let for_body = ui.clone();
     let for_footer = ui.clone();
     let for_chrome = ui.clone();
+    let for_chrome_tabs = ui.clone();
 
     view()
         .flex_1()
@@ -4436,7 +4439,7 @@ pub fn App() -> impl IntoElement {
                 )
                 // 底部四 Tab：只在主 Tab 页显示。
                 .child(dynamic(move || {
-                    let ui = for_chrome.clone();
+                    let ui = for_chrome_tabs.clone();
                     if is_main_screen(ui.screen.get()) {
                         vec![bottom_tabs(ui.clone()).into_element()]
                     } else {
